@@ -768,7 +768,7 @@ def plot_heatmap(heatmap_data, mask, name):
     plt.savefig(f'{PLOTS_PATH}_{name}.png')
     plt.close()
     
-def plot_culumative_metrics(cumulative_metrics_df, name):
+def plot_cumulative_metrics(cumulative_metrics_df, name):
     plt.figure(figsize=(14, 8))
     plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative Accuracy'], label='Cumulative Accuracy', color='blue')
     plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative Precision'], label='Cumulative Precision', color='orange')
@@ -805,7 +805,12 @@ def group_confusion_matrix(true_labels, predicted_labels, n_classes=21):
     
     return group_conf_matrix
 
-def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, model_type=MODEL_TYPE, X_test=None, model=None):
+def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, X_test=None, model=None, tolerance_window=None):
+    
+    # To avoid overwriting the original predictions when applying a tolerance window
+    original_test_predictions = test_predictions.copy()
+    tolerance_str = f"_tolerance_{tolerance_window}" if tolerance_window is not None else "_default"
+    
     if MODEL_TYPE == 'IsolationForest':
         test_predictions = test_predictions.map({-1: 1, 1: 0})
         report = classification_report(test_labels, test_predictions, target_names=['No Coseismic Event', 'Coseismic Event'])
@@ -815,6 +820,24 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, model_type=
         
         conf_matrix = confusion_matrix(test_labels, test_predictions)
         print(f"Confusion Matrix: \n{conf_matrix}")
+        
+        return original_test_predictions
+
+    if tolerance_window is not None:
+        print(f'Tolerance window is active, classifications that were missed by {tolerance_window} day(s) count as correctly classified.')
+        test_labels_np = test_labels.to_numpy()
+        test_predictions_np = test_predictions.to_numpy()
+        
+        for i in range(len(test_labels_np)):
+            # Check if misclassification occurs and adjust within tolerance window
+            if test_labels_np[i] != test_predictions_np[i]:
+                for offset in range(-tolerance_window, tolerance_window + 1):
+                    if 0 <= i + offset < len(test_labels_np):
+                        if test_labels_np[i + offset] == test_predictions_np[i]:
+                            test_predictions_np[i] = test_labels_np[i]
+                            break
+
+        test_predictions = pd.Series(test_predictions_np, index=test_labels.index)
 
     report = classification_report(test_labels, test_predictions)
     print(f'Evaluation of performance for model: {MODEL_TYPE} \n')
@@ -822,9 +845,9 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, model_type=
     
     conf_matrix = group_confusion_matrix(test_labels, test_predictions)
     print(f"Grouped Confusion Matrix by date of earthquake (No, Early, Middle, Late): \n{conf_matrix} \n")
-    
-    plot_histogram(test_predictions.value_counts().subtract(test_labels.value_counts(), fill_value=0), 'Chunk Index', 'Difference (Predicted - True)', 'Difference between predicted and actual earthquakes at chunk indices', 'hist_predtest')
-    
+
+    plot_histogram(test_predictions.value_counts().subtract(test_labels.value_counts(), fill_value=0), 'Chunk Index', 'Difference (Predicted - True)', 'Difference between predicted and actual earthquakes at chunk indices', f'hist_predtest{tolerance_str}')
+
     false_positive_rate = np.sum((test_predictions == 1) & (test_labels == 0)) / np.sum(test_labels == 0)
     false_negative_rate = np.sum((test_predictions == 0) & (test_labels == 1)) / np.sum(test_labels == 1)
 
@@ -849,7 +872,7 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, model_type=
 
     chunk_report = classification_report(chunk_labels, chunk_predictions)
     print(f"Chunk-Based Binary Classification Report: {chunk_report} \n")
-    
+
     time_index = test_labels.index.to_numpy()
     test_labels = test_labels.to_numpy()
     test_predictions = test_predictions.to_numpy()
@@ -865,13 +888,15 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, model_type=
         'Date': time_index[incorrect_indices]
     })
     
+    plot_histogram(result_df['Missed By'].value_counts(), xlabel='Number of Days Missed By', ylabel='Count', title='Histogram of Misclassifications by Number of Days Missed By', name=f'hist_nbrdays{tolerance_str}')
+    
     result_df['Date'] = pd.to_datetime(result_df['Date'])
     result_df['Month'] = result_df['Date'].dt.to_period('M').apply(lambda r: r.start_time)
     result_df['Missed By Rounded'] = result_df['Missed By'].round()
     heatmap_data = result_df.pivot_table(index='Missed By Rounded', columns='Month', aggfunc='size', fill_value=0)
     mask = heatmap_data == 0
 
-    plot_heatmap(np.log1p(heatmap_data), mask, 'heatmap')
+    plot_heatmap(np.log1p(heatmap_data), mask, f'heatmap{tolerance_str}')
     
     cumulative_metrics_df = pd.DataFrame({
     'Date': time_index, 
@@ -909,31 +934,23 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, model_type=
     cumulative_metrics_df['Date'] = pd.to_datetime(cumulative_metrics_df['Date'])
     cumulative_metrics_df = cumulative_metrics_df.sort_values('Date')
     
-    plot_culumative_metrics(cumulative_metrics_df, 'cumulative_metrics')
-    
-    incorrect_indices = np.where(test_labels != test_predictions)[0]
-    index_miss_differences = np.abs(test_labels[incorrect_indices] - test_predictions[incorrect_indices])
-
-    result_df = pd.DataFrame({
-        'True Label': test_labels[incorrect_indices],
-        'Predicted Label': test_predictions[incorrect_indices],
-        'Missed By': index_miss_differences,
-        'Index': incorrect_indices
-    })
-    
-    plot_histogram(result_df['Missed By'].value_counts(), xlabel='Number of Days Missed By', ylabel='Count', title='Histogram of Misclassifications by Number of Days Missed By', name='hist_nbrdays')
+    plot_cumulative_metrics(cumulative_metrics_df, f'cumulative_metrics{tolerance_str}')
     
     if X_test is not None and model is not None:
         try:
-            probs = model.predict_proba(X_test)[:, 1]
-            auc_score = roc_auc_score(test_labels, probs)
+            probs = model.predict_proba(X_test)
+            auc_score = roc_auc_score(test_labels, probs, multi_class='ovr')
             print(f"AUC Score: {auc_score}")
         except AttributeError:
             print("AUC score calculation skipped, as the model does not support probabilities.")
 
     if model is not None and hasattr(model, 'feature_importances_'):
         feature_importances = model.feature_importances_
-        print(f"Feature Importances: {feature_importances}")
+        num_features = 3
+        averaged_importances = np.mean(feature_importances.reshape(-1, num_features), axis=0)
+        print(f"Averaged Feature Importances (Displacement in N, E, U): {averaged_importances}")
+        
+    return original_test_predictions
 
 def train_model(X, y, start_index, model_type):
     """
@@ -976,8 +993,9 @@ def train_model(X, y, start_index, model_type):
     joblib.dump(model, MODEL_PATH)
     save_csv(test_predictions, PREDICTIONS_PATH)
     save_csv(test_labels, TEST_LABELS_PATH)
-    
-    evaluation(test_predictions, test_labels)
+    for window in [None, 1]:
+        test_predictions = evaluation(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window)
+
 
 def main():
     """
