@@ -6,31 +6,41 @@ import numpy as np
 import re
 from shapely.geometry import Point
 from pathlib import Path
+from collections import Counter
 from sklearn.ensemble import IsolationForest, HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.multiclass import OneVsRestClassifier
 import joblib
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_fscore_support
 from xgboost import XGBClassifier
+from imblearn.over_sampling import SMOTE
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 DATA_PATH = '/cluster/home/nteutschm/eqdetection/data/'
 RANDOM_STATE = 86
-MODEL_TYPE = 'RandomForest' # IsolationForest HistGradientBoosting RandomForest XGBoost
+MODEL_TYPE = 'HistGradientBoosting' # IsolationForest HistGradientBoosting RandomForest XGBoost
 
 MODEL_PATH = f'/cluster/scratch/nteutschm/eqdetection/models/{MODEL_TYPE}.pkl'
 PREDICTIONS_PATH = f'/cluster/scratch/nteutschm/eqdetection/predictions/{MODEL_TYPE}.csv'
+TEST_LABELS_PATH = f'/cluster/scratch/nteutschm/eqdetection/test_labels/{MODEL_TYPE}.csv'
 FEATURES_PATH = f'/cluster/scratch/nteutschm/eqdetection/features/{MODEL_TYPE}'
+PLOTS_PATH = f'/cluster/scratch/nteutschm/eqdetection/plots/{MODEL_TYPE}'
 
 LOAD_MODEL = False # If already trained model is saved under MODEL_PATH, it can be loaded if set to True to skip the entire training process
 
 # Optimal parameters:
 OPTIMAL_PARAMS = False # If optimal parametrs should be used, or the parameters should be tuned (set to False)
 
+# How big each chunk should be
+CHUNK_SIZE = 21
+
 # If OPTIMAL_PARAMS is True, these parameters are used for the training process:
 BEST_PARAMS_RANDOM_FOREST = {
     'n_estimators': 100,
     'max_depth': 30,
-    'class_weight': {0: 0.5520685260526444, 1: 5.3013650270651915},
+    'class_weight': {0: 0.04991626849390834, 1: 20.055555555555557, 2: 19.0, 3: 20.180124223602483, 4: 20.433962264150942, 5: 19.8109756097561, 6: 20.694267515923567, 7: 19.8109756097561, 8: 19.69090909090909, 9: 21.66, 10: 20.30625, 11: 20.826923076923077, 12: 22.253424657534246, 13: 21.375, 14: 20.826923076923077, 15: 20.055555555555557, 16: 22.5625, 17: 22.253424657534246, 18: 21.66, 19: 21.66, 20: 19.69090909090909},
     'random_state': RANDOM_STATE
 }
 
@@ -42,7 +52,7 @@ BEST_PARAMS_ISOLATION_FOREST = {
 }
 
 BEST_PARAMS_HIST_GRADIENT_BOOSTING = {
-    'learning_rate': 0.1,
+    'learning_rate': 0.2,
     'max_iter': 300,
     'max_depth': 15,
     'class_weight': {0: 0.5255337831592569, 1: 10.290950226244345},
@@ -56,12 +66,10 @@ BEST_PARAMS_XGBOOST = {
     'n_estimators': 500,
     'max_depth': 10,
     'learning_rate': 0.1,
-    'class_weight': 10,
     'random_state': RANDOM_STATE,
-    'objective': 'binary:logistic',
-    'eval_metric': 'logloss'
+    'objective': 'multi:softprob',
+    'eval_metric': 'mlogloss'
 }
-
 
 def get_offsets(header_lines):
     """
@@ -283,7 +291,7 @@ def clean_dataframes(dfs, missing_value_threshold=None, limited_period=False, mi
 
     return cleaned_dfs
 
-def extract_features(dfs, interpolate=True, chunk_size=21):
+def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
     """
     Extracts relevant features from a list of dataframes, including displacement values, 
     errors, offsets, decay information, station locations, and heights.
@@ -298,6 +306,7 @@ def extract_features(dfs, interpolate=True, chunk_size=21):
     """
     feature_matrix = []
     target_vector = []
+    time_index = []
     components_offsets = ['n', 'e', 'u'] 
     
     #columns to include in creating the chunks, (offset and decay not really necessary, as crucial information already present in labels -> pay attention to not use this information in test data)
@@ -350,6 +359,8 @@ def extract_features(dfs, interpolate=True, chunk_size=21):
             feature_row = np.hstack([features[col].values[i:i + chunk_size] for col in cols])
             feature_matrix.append(feature_row)
             
+            time_index.append(features.index[i])
+            
             offset_values_chunk = features[['n_offset_value', 'e_offset_value', 'u_offset_value']].iloc[i:i + chunk_size]
             
             if MODEL_TYPE=='IsolationForest':
@@ -371,9 +382,9 @@ def extract_features(dfs, interpolate=True, chunk_size=21):
                     target_vector.append(0)
 
     feature_matrix = np.array(feature_matrix)
-    return pd.DataFrame(feature_matrix), target_vector
+    return pd.DataFrame(feature_matrix), target_vector, time_index
 
-def save_predictions(test_predictions):
+def save_csv(test_predictions, path):
     """
     Saves the test predictions to a CSV file.
 
@@ -386,7 +397,7 @@ def save_predictions(test_predictions):
     Returns:
     None
     """
-    test_predictions.to_csv(PREDICTIONS_PATH, index=True)
+    test_predictions.to_csv(path, index=True)
     
 def compute_weights(train_labels):
     """
@@ -406,13 +417,14 @@ def compute_weights(train_labels):
     class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=train_labels)
     return {c: w for c, w in zip(classes, class_weights)}
 
-def prepare_data(X, y, test_size=0.3, random_state=RANDOM_STATE):
+def prepare_data(X, y, start_index, test_size=0.3, random_state=RANDOM_STATE):
     """
     Prepares training and testing data by splitting the feature matrix and target vector.
+    Applies SMOTE to balance the training set.
 
     Parameters:
     X (DataFrame): The feature matrix (chunked GNSS data).
-    y (list or Series): The target labels (0 for no offset, 1 for offset).
+    y (list or Series): The target labels (multiclass).
     test_size (float): Proportion of the dataset to include in the test split.
     random_state (int): Random seed for reproducibility.
 
@@ -424,16 +436,30 @@ def prepare_data(X, y, test_size=0.3, random_state=RANDOM_STATE):
     class_weights (dict): Weights for handling imbalanced classes.
     """
     # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
-    y_train = pd.Series(y_train)
-    y_test = pd.Series(y_test)
+    X_train, X_test, y_train, y_test, _, test_start_index = train_test_split(X, y, start_index, test_size=test_size, random_state=random_state)
+    
+    # Oversample the minority classes to a random percentage between 10% and 40% of the majority class
+    rng = np.random.default_rng(seed=RANDOM_STATE)
+    
+    class_counts = Counter(y_train)
+    majority_class = max(class_counts, key=class_counts.get)
+
+    sampling_strategy = {}
+    for cls in class_counts:
+        if cls != majority_class:
+            random_percentage = rng.uniform(0.20, 0.40)
+            target_count = int(class_counts[majority_class] * random_percentage)
+            sampling_strategy[cls] = target_count
+    
+    smote = SMOTE(sampling_strategy=sampling_strategy, random_state=random_state)
+    X_train, y_train = smote.fit_resample(X_train, y_train)
 
     # Compute class weights to handle imbalanced dataset
     class_weights = compute_weights(y_train)
     
-    return X_train, X_test, y_train, y_test, class_weights
+    return X_train, X_test, y_train, y_test, class_weights, test_start_index
 
-def random_forest():
+def random_forest(weights):
     """
     Returns a Random Forest classifier model configured with the optimal parameters.
 
@@ -447,7 +473,7 @@ def random_forest():
     model = RandomForestClassifier(
         n_estimators=BEST_PARAMS_RANDOM_FOREST['n_estimators'],
         max_depth=BEST_PARAMS_RANDOM_FOREST['max_depth'],
-        class_weight=BEST_PARAMS_RANDOM_FOREST['class_weight'],
+        class_weight=weights,#BEST_PARAMS_RANDOM_FOREST['class_weight'],
         random_state=BEST_PARAMS_RANDOM_FOREST['random_state']
     )
     return model
@@ -471,7 +497,7 @@ def isolation_forest():
     )
     return model
 
-def hist_gradient_boosting():
+def hist_gradient_boosting(weights):
     """
     Returns a HistGradientBoostingClassifier model configured with the optimal parameters.
 
@@ -486,7 +512,7 @@ def hist_gradient_boosting():
         learning_rate=BEST_PARAMS_HIST_GRADIENT_BOOSTING['learning_rate'],
         max_iter=BEST_PARAMS_HIST_GRADIENT_BOOSTING['max_iter'],
         max_depth=BEST_PARAMS_HIST_GRADIENT_BOOSTING['max_depth'],
-        class_weight=BEST_PARAMS_HIST_GRADIENT_BOOSTING['class_weight'],
+        class_weight=weights, #BEST_PARAMS_HIST_GRADIENT_BOOSTING['sample_weight'],
         random_state=BEST_PARAMS_HIST_GRADIENT_BOOSTING['random_state'],
         early_stopping=BEST_PARAMS_HIST_GRADIENT_BOOSTING['early_stopping'],
         n_iter_no_change=BEST_PARAMS_HIST_GRADIENT_BOOSTING['n_iter_no_change'],
@@ -494,7 +520,7 @@ def hist_gradient_boosting():
     )
     return model
 
-def xgboost():
+def xgboost(y_train):
     """
     Returns an XGBoost classifier model configured with the optimal parameters.
 
@@ -509,10 +535,10 @@ def xgboost():
         n_estimators=BEST_PARAMS_XGBOOST['n_estimators'],
         max_depth=BEST_PARAMS_XGBOOST['max_depth'],
         learning_rate=BEST_PARAMS_XGBOOST['learning_rate'],
-        class_weight=BEST_PARAMS_XGBOOST['class_weight'],
         random_state=BEST_PARAMS_XGBOOST['random_state'],
         objective=BEST_PARAMS_XGBOOST['objective'],
-        eval_metric=BEST_PARAMS_XGBOOST['eval_metric']
+        eval_metric=BEST_PARAMS_XGBOOST['eval_metric'],
+        num_class=len(set(y_train))
     )
     return model
 
@@ -540,15 +566,17 @@ def optimize_random_forest(X_train, y_train, weights):
     
     if OPTIMAL_PARAMS:
         print(f'Training Random Forest model using the specified optimal parameters: {BEST_PARAMS_RANDOM_FOREST}')
-        return random_forest()
+        model = random_forest(weights)
+        return OneVsRestClassifier(model).fit(X_train, y_train)
     
+    #If we are using OneVsRestClassifier, we need to specify that the searched parameters are meant for the estimator as OneVsRestClassifier lacks most of these
     param_grid = {
-        'n_estimators': [100, 300, 500],
-        'max_depth': [10, 30, 50],
-        'class_weight': [weights], 
-        'random_state': [RANDOM_STATE]
+        'estimator__n_estimators': [100, 300, 500],
+        'estimator__max_depth': [10, 30, 50],
+        'estimator__class_weight': [weights], 
+        'estimator__random_state': [RANDOM_STATE]
     }
-    rf = RandomForestClassifier()
+    rf = OneVsRestClassifier(RandomForestClassifier())
     stratified_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     grid_search = GridSearchCV(rf, param_grid, cv=stratified_cv, scoring='f1_weighted', verbose=3, n_jobs=-1, pre_dispatch='2*n_jobs')
     grid_search.fit(X_train, y_train)
@@ -580,7 +608,8 @@ def optimize_isolation_forest(X_train, y_train):
     
     if OPTIMAL_PARAMS:
         print(f'Training Isolation Forest model using the specified optimal parameters: {BEST_PARAMS_ISOLATION_FOREST}')
-        return isolation_forest()
+        model = isolation_forest()
+        return model.fit(X_train)
     
     param_grid = {
         'n_estimators': [100, 200, 300],
@@ -622,19 +651,20 @@ def optimize_hist_gradient_boosting(X_train, y_train, weights):
     
     if OPTIMAL_PARAMS:
         print(f'Training Hist Gradient Boosting model using the specified optimal parameters: {BEST_PARAMS_HIST_GRADIENT_BOOSTING}')
-        return hist_gradient_boosting()
+        model = hist_gradient_boosting(weights)
+        return OneVsRestClassifier(model).fit(X_train, y_train)
     
     param_grid = {
-        'learning_rate': [0.01, 0.1, 0.2],
-        'max_iter': [100, 200, 300],
-        'max_depth': [5, 10, 15, 30],
-        'class_weight': [weights],
-        'random_state': [RANDOM_STATE]
+        'estimator__learning_rate': [0.01, 0.1, 0.2],
+        'estimator__max_iter': [100, 200, 300],
+        'estimator__max_depth': [5, 10, 15, 30],
+        'estimator__class_weight': [weights],
+        'estimator__random_state': [RANDOM_STATE]
     }
         
-    hgb = HistGradientBoostingClassifier(early_stopping=True,
+    hgb = OneVsRestClassifier(HistGradientBoostingClassifier(early_stopping=True,
         n_iter_no_change=7,
-        validation_fraction=0.1)
+        validation_fraction=0.1))
     
     stratified_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     grid_search = GridSearchCV(
@@ -652,7 +682,7 @@ def optimize_hist_gradient_boosting(X_train, y_train, weights):
     
     return grid_search.best_estimator_
 
-def optimize_xgboost(X_train, y_train, weights):
+def optimize_xgboost(X_train, y_train):
     """
     Optimizes an XGBoost classifier using grid search with cross-validation.
 
@@ -676,17 +706,17 @@ def optimize_xgboost(X_train, y_train, weights):
     
     if OPTIMAL_PARAMS:
         print(f'Training XGBoost model using the specified optimal parameters: {BEST_PARAMS_XGBOOST}')
-        return xgboost()
+        model = xgboost(y_train)
+        return model.fit(X_train, y_train)
     
     param_grid = {
         'n_estimators': [100, 300, 500],
         'max_depth': [5, 10, 15, 30],
         'learning_rate': [0.01, 0.1, 0.2],
-        'class_weight': [weights],
         'random_state': [RANDOM_STATE]
     }
     
-    xgb = XGBClassifier(objective='multi:softmax', eval_metric='mlogloss', num_class=len(set(y_train)))
+    xgb = XGBClassifier(objective='multi:softprob', eval_metric='mlogloss', num_class=len(set(y_train)))
 
     stratified_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     grid_search = GridSearchCV(
@@ -704,7 +734,225 @@ def optimize_xgboost(X_train, y_train, weights):
     
     return grid_search.best_estimator_
 
-def train_model(X, y, model_type):
+def plot_histogram(series, xlabel, ylabel, title, name):
+    plt.figure(figsize=(12, 10))
+    plt.bar(series.index, series.values, color='b')
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png')
+    plt.close()
+    
+def plot_heatmap(heatmap_data, mask, name):
+    plt.figure(figsize=(12, 6))
+    sns.heatmap(
+        heatmap_data,
+        cmap='viridis', 
+        mask=mask,       
+        cbar_kws={'label': 'Log(Number of Misclassifications)'},
+        linewidths=0.5,
+        linecolor='lightgrey'
+    )
+
+    # Set x-ticks to match the columns of the heatmap data with a step for reducing overcrowding
+    tick_step = 6  
+    plt.xticks(ticks=np.arange(0, len(heatmap_data.columns), tick_step), 
+            labels=[date.strftime('%Y-%m') for date in heatmap_data.columns[::tick_step]], 
+            rotation=45)
+
+    plt.title('Logarithmic Heatmap of Missed Predictions Over Time')
+    plt.xlabel('Year-Month')
+    plt.ylabel('Days Missed By')
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png')
+    plt.close()
+    
+def plot_cumulative_metrics(cumulative_metrics_df, name):
+    plt.figure(figsize=(14, 8))
+    plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative Accuracy'], label='Cumulative Accuracy', color='blue')
+    plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative Precision'], label='Cumulative Precision', color='orange')
+    plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative Recall'], label='Cumulative Recall', color='green')
+    plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative F1'], label='Cumulative F1 Score', color='purple')
+
+    plt.title('Cumulative Metrics Over Time (Smoothed over 90 days)')
+    plt.xlabel('Date')
+    plt.ylabel('Metric Value')
+
+    plt.xticks(ticks=cumulative_metrics_df['Date'][::10000],
+            labels=cumulative_metrics_df['Date'][::10000].dt.strftime('%Y-%m'), rotation=45)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5, color='gray')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png')
+    plt.close()
+    
+def group_confusion_matrix(true_labels, predicted_labels, n_classes=21):
+    groups = {'No': [0], 'Early': range(1, 7), 'Middle': range(7, 14), 'Late': range(14, n_classes)}
+    
+    def map_to_group(label):
+        for group, indices in groups.items():
+            if label in indices:
+                return group
+        return None
+
+    true_groups = np.array([map_to_group(label) for label in true_labels])
+    pred_groups = np.array([map_to_group(label) for label in predicted_labels])
+    
+    unique_groups = list(groups.keys())
+    
+    group_conf_matrix = confusion_matrix(true_groups, pred_groups, labels=unique_groups)
+    
+    return group_conf_matrix
+
+def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, X_test=None, model=None, tolerance_window=None):
+    
+    # To avoid overwriting the original predictions when applying a tolerance window
+    original_test_predictions = test_predictions.copy()
+    tolerance_str = f"_tolerance_{tolerance_window}" if tolerance_window is not None else "_default"
+    
+    if MODEL_TYPE == 'IsolationForest':
+        test_predictions = test_predictions.map({-1: 1, 1: 0})
+        report = classification_report(test_labels, test_predictions, target_names=['No Coseismic Event', 'Coseismic Event'])
+        
+        print(f'Evaluation of performance for model (trained solely binary): {MODEL_TYPE} \n')
+        print(f"Binary Classification Report: \n {report}")
+        
+        conf_matrix = confusion_matrix(test_labels, test_predictions)
+        print(f"Confusion Matrix: \n{conf_matrix}")
+        
+        return original_test_predictions
+
+    if tolerance_window is not None:
+        print(f'Tolerance window is active, classifications that were missed by {tolerance_window} day(s) count as correctly classified.')
+        test_labels_np = test_labels.to_numpy()
+        test_predictions_np = test_predictions.to_numpy()
+        
+        for i in range(len(test_labels_np)):
+            # Check if misclassification occurs and adjust within tolerance window
+            if test_labels_np[i] != test_predictions_np[i]:
+                for offset in range(-tolerance_window, tolerance_window + 1):
+                    if 0 <= i + offset < len(test_labels_np):
+                        if test_labels_np[i + offset] == test_predictions_np[i]:
+                            test_predictions_np[i] = test_labels_np[i]
+                            break
+
+        test_predictions = pd.Series(test_predictions_np, index=test_labels.index)
+
+    report = classification_report(test_labels, test_predictions)
+    print(f'Evaluation of performance for model: {MODEL_TYPE} \n')
+    print(f'Multi-Class Classification Report: \n {report} \n')
+    
+    conf_matrix = group_confusion_matrix(test_labels, test_predictions)
+    print(f"Grouped Confusion Matrix by date of earthquake (No, Early, Middle, Late): \n{conf_matrix} \n")
+
+    plot_histogram(test_predictions.value_counts().subtract(test_labels.value_counts(), fill_value=0), 'Chunk Index', 'Difference (Predicted - True)', 'Difference between predicted and actual earthquakes at chunk indices', f'hist_predtest{tolerance_str}')
+
+    false_positive_rate = np.sum((test_predictions == 1) & (test_labels == 0)) / np.sum(test_labels == 0)
+    false_negative_rate = np.sum((test_predictions == 0) & (test_labels == 1)) / np.sum(test_labels == 1)
+
+    print(f"False Positive Rate: {false_positive_rate}")
+    print(f"False Negative Rate: {false_negative_rate}")
+    
+    num_chunks = len(test_labels) // chunk_size
+    chunk_indices = np.array_split(np.arange(len(test_labels)), num_chunks)
+
+    chunk_labels = []
+    chunk_predictions = []
+
+    for chunk in chunk_indices:
+        chunk_label = 1 if np.any(test_labels.iloc[chunk].to_numpy() != 0) else 0
+        chunk_pred = 1 if np.any(test_predictions.iloc[chunk].to_numpy() != 0) else 0
+        
+        chunk_labels.append(chunk_label)
+        chunk_predictions.append(chunk_pred)
+
+    chunk_labels = np.array(chunk_labels)
+    chunk_predictions = np.array(chunk_predictions)
+
+    chunk_report = classification_report(chunk_labels, chunk_predictions)
+    print(f"Chunk-Based Binary Classification Report: {chunk_report} \n")
+
+    time_index = test_labels.index.to_numpy()
+    test_labels = test_labels.to_numpy()
+    test_predictions = test_predictions.to_numpy()
+
+    incorrect_indices = np.where(test_labels != test_predictions)[0]
+    index_miss_differences = np.abs(test_labels[incorrect_indices] - test_predictions[incorrect_indices])
+
+    result_df = pd.DataFrame({
+        'True Label': test_labels[incorrect_indices],
+        'Predicted Label': test_predictions[incorrect_indices],
+        'Missed By': index_miss_differences,
+        'Index': incorrect_indices,
+        'Date': time_index[incorrect_indices]
+    })
+    
+    plot_histogram(result_df['Missed By'].value_counts(), xlabel='Number of Days Missed By', ylabel='Count', title='Histogram of Misclassifications by Number of Days Missed By', name=f'hist_nbrdays{tolerance_str}')
+    
+    result_df['Date'] = pd.to_datetime(result_df['Date'])
+    result_df['Month'] = result_df['Date'].dt.to_period('M').apply(lambda r: r.start_time)
+    result_df['Missed By Rounded'] = result_df['Missed By'].round()
+    heatmap_data = result_df.pivot_table(index='Missed By Rounded', columns='Month', aggfunc='size', fill_value=0)
+    mask = heatmap_data == 0
+
+    plot_heatmap(np.log1p(heatmap_data), mask, f'heatmap{tolerance_str}')
+    
+    cumulative_metrics_df = pd.DataFrame({
+    'Date': time_index, 
+    'Labels': test_labels,
+    'Predictions': test_predictions
+})
+
+    cumulative_metrics_df['Cumulative Correct'] = (cumulative_metrics_df['Labels'] == cumulative_metrics_df['Predictions']).cumsum()
+    cumulative_metrics_df['Cumulative Accuracy'] = cumulative_metrics_df['Cumulative Correct'] / np.arange(1, len(cumulative_metrics_df) + 1)
+
+    cumulative_precisions = []
+    cumulative_recalls = []
+    cumulative_f1_scores = []
+
+    for i in range(1, len(cumulative_metrics_df) + 1):
+        current_labels = cumulative_metrics_df['Labels'][:i]
+        current_predictions = cumulative_metrics_df['Predictions'][:i]
+
+        precision, recall, f1, _ = precision_recall_fscore_support(current_labels, current_predictions, average='macro', zero_division=0)
+
+        cumulative_precisions.append(precision)
+        cumulative_recalls.append(recall)
+        cumulative_f1_scores.append(f1)
+
+    cumulative_metrics_df['Cumulative Precision'] = cumulative_precisions
+    cumulative_metrics_df['Cumulative Recall'] = cumulative_recalls
+    cumulative_metrics_df['Cumulative F1 Score'] = cumulative_f1_scores
+
+    window_size = 90
+    cumulative_metrics_df['Smoothed Cumulative Accuracy'] = cumulative_metrics_df['Cumulative Accuracy'].rolling(window=window_size, min_periods=1).mean()
+    cumulative_metrics_df['Smoothed Cumulative Precision'] = cumulative_metrics_df['Cumulative Precision'].rolling(window=window_size, min_periods=1).mean()
+    cumulative_metrics_df['Smoothed Cumulative Recall'] = cumulative_metrics_df['Cumulative Recall'].rolling(window=window_size, min_periods=1).mean()
+    cumulative_metrics_df['Smoothed Cumulative F1'] = cumulative_metrics_df['Cumulative F1 Score'].rolling(window=window_size, min_periods=1).mean()
+
+    cumulative_metrics_df['Date'] = pd.to_datetime(cumulative_metrics_df['Date'])
+    cumulative_metrics_df = cumulative_metrics_df.sort_values('Date')
+    
+    plot_cumulative_metrics(cumulative_metrics_df, f'cumulative_metrics{tolerance_str}')
+    
+    if X_test is not None and model is not None:
+        try:
+            probs = model.predict_proba(X_test)
+            auc_score = roc_auc_score(test_labels, probs, multi_class='ovr')
+            print(f"AUC Score: {auc_score}")
+        except AttributeError:
+            print("AUC score calculation skipped, as the model does not support probabilities.")
+
+    if model is not None and hasattr(model, 'feature_importances_'):
+        feature_importances = model.feature_importances_
+        num_features = 3
+        averaged_importances = np.mean(feature_importances.reshape(-1, num_features), axis=0)
+        print(f"Averaged Feature Importances (Displacement in N, E, U): {averaged_importances}")
+        
+    return original_test_predictions
+
+def train_model(X, y, start_index, model_type):
     """
     Trains a model based on the specified type using both North, East, and Up component data.
 
@@ -718,7 +966,7 @@ def train_model(X, y, model_type):
     report: Classification report for the test set.
     """
     
-    X_train, X_test, train_labels, test_labels, weights = prepare_data(X, y)
+    X_train, X_test, train_labels, test_labels, weights, test_start_index = prepare_data(X, y, start_index)
 
     if model_type == 'IsolationForest':
         model = optimize_isolation_forest(X_train, train_labels)
@@ -733,24 +981,21 @@ def train_model(X, y, model_type):
         test_predictions = model.predict(X_test)
         
     elif model_type == 'XGBoost':
-        model = optimize_xgboost(X_train, train_labels, weights)
+        model = optimize_xgboost(X_train, train_labels)
         test_predictions = model.predict(X_test)
         
     else:
         raise ValueError('Used Model Type not implemented. Please control spelling!')
     
-    test_predictions = pd.Series(test_predictions, index=X_test.index)
+    test_predictions = pd.Series(test_predictions, index=test_start_index)
+    test_labels = pd.Series(test_labels, index=test_start_index)
     
     joblib.dump(model, MODEL_PATH)
-    save_predictions(test_predictions)
-    
-    if model_type == 'IsolationForest':
-        test_predictions = test_predictions.map({-1: 1, 1: 0})
-        report = classification_report(test_labels, test_predictions, target_names=['No Coseismic Event', 'Coseismic Event'])
-    else:
-        report = classification_report(test_labels, test_predictions)
+    save_csv(test_predictions, PREDICTIONS_PATH)
+    save_csv(test_labels, TEST_LABELS_PATH)
+    for window in [None, 1]:
+        test_predictions = evaluation(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window)
 
-    return model, test_predictions, report
 
 def main():
     """
@@ -779,14 +1024,12 @@ def main():
     
     # HistGradientBoosting designed to deal with None data -> No interpolation needed
     interpolate = False if MODEL_TYPE == 'HistGradientBoosting' else True
-    X, y = extract_features(cleaned_dfs, interpolate=interpolate)
+    X, y, start_index = extract_features(cleaned_dfs, interpolate=interpolate)
     
     X.to_csv(f'{FEATURES_PATH}_features.csv', index=True)
     pd.Series(y).to_csv(f'{FEATURES_PATH}_target.csv', index=False, header=False)
     
-    model, test_predictions, report = train_model(X, y, model_type=MODEL_TYPE)
-    print(f'Report for model: {MODEL_TYPE} \n {report}')
+    train_model(X, y, start_index, model_type=MODEL_TYPE)
 
 if __name__=='__main__':
     main()
-
