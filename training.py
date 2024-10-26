@@ -11,6 +11,7 @@ from sklearn.ensemble import IsolationForest, HistGradientBoostingClassifier, Ra
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.multiclass import OneVsRestClassifier
+from sklearn.preprocessing import MinMaxScaler
 import joblib
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_fscore_support
 from xgboost import XGBClassifier
@@ -19,19 +20,32 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 DATA_PATH = '/cluster/home/nteutschm/eqdetection/data/'
-RANDOM_STATE = 86
-MODEL_TYPE = 'HistGradientBoosting' # IsolationForest HistGradientBoosting RandomForest XGBoost
+RANDOM_STATE = 47
+# Available: IsolationForest HistGradientBoosting RandomForest XGBoost
+MODEL_TYPE = 'XGBoost'
 
 MODEL_PATH = f'/cluster/scratch/nteutschm/eqdetection/models/{MODEL_TYPE}.pkl'
 PREDICTIONS_PATH = f'/cluster/scratch/nteutschm/eqdetection/predictions/{MODEL_TYPE}.csv'
 TEST_LABELS_PATH = f'/cluster/scratch/nteutschm/eqdetection/test_labels/{MODEL_TYPE}.csv'
 FEATURES_PATH = f'/cluster/scratch/nteutschm/eqdetection/features/{MODEL_TYPE}'
+STATION_NAMES = f'/cluster/scratch/nteutschm/eqdetection/stations/{MODEL_TYPE}.csv'
 PLOTS_PATH = f'/cluster/scratch/nteutschm/eqdetection/plots/{MODEL_TYPE}'
+CLEANED_DATA_PATH = f'/cluster/scratch/nteutschm/eqdetection/data/dfs.pkl'
 
-LOAD_MODEL = False # If already trained model is saved under MODEL_PATH, it can be loaded if set to True to skip the entire training process
+LOAD_MODEL = True # If already trained model is saved under MODEL_PATH, it can be loaded if set to True to skip the entire training process
 
-# Optimal parameters:
-OPTIMAL_PARAMS = False # If optimal parametrs should be used, or the parameters should be tuned (set to False)
+#columns to include in creating the chunks, (offset and decay not really necessary, as crucial information already present in labels)
+#available: ['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU', 'latitude', 'cos_longitude', 'sin_longitude', 'height', 'offset_value', 'offset_error', 'decay_value', 'decay_error', 'decay_tau', 'decay_type']
+USED_COLS = ['N', 'E', 'U']
+
+
+OPTIMAL_PARAMS = True # If optimal parametrs should be used to train the model, or the parameters should be tuned (set to False)
+
+# How much percentage (expressed between 0 and 1) of the majority class the minority classes should be (lower end, upper end)
+OVERSAMPLING_PERCENTAGES = (0.3, 0.5)
+
+# How many days before the first and after the last earthquake should be selected (lower end, upper end)
+NBR_OF_DAYS = (182, 366)
 
 # How big each chunk should be
 CHUNK_SIZE = 21
@@ -245,10 +259,12 @@ def clean_dataframes(dfs, missing_value_threshold=None, limited_period=False, mi
     components = ['N', 'E', 'U']
     components_offsets = ['n', 'e', 'u']
 
-    for org_df in dfs:
+    for df in dfs:
+        
+        name = df.name
         
         has_coseismic = False
-        df = add_missing_dates(org_df)
+        df = add_missing_dates(df)
 
         # Determine the range of coseismic offsets
         first_coseismic_date = None
@@ -274,8 +290,8 @@ def clean_dataframes(dfs, missing_value_threshold=None, limited_period=False, mi
 
         # Trim data to include the range around the coseismic offsets if days_included is provided
         if first_coseismic_date and limited_period:
-            start_date = first_coseismic_date - pd.Timedelta(days=rng.integers(100, 366))
-            end_date = last_coseismic_date + pd.Timedelta(days=rng.integers(100, 366))
+            start_date = first_coseismic_date - pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
+            end_date = last_coseismic_date + pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
             df = df[(df.index >= start_date) & (df.index <= end_date)]
 
         # Check missing values for all components combined, if threshold is provided
@@ -286,7 +302,7 @@ def clean_dataframes(dfs, missing_value_threshold=None, limited_period=False, mi
             missing_percentage = missing_values / total_values
             if missing_percentage > missing_value_threshold:
                 continue  # Skip the dataframe if missing values exceed the threshold
-
+        df.name = name
         cleaned_dfs.append(df)
 
     return cleaned_dfs
@@ -307,15 +323,11 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
     feature_matrix = []
     target_vector = []
     time_index = []
+    station_names = []
     components_offsets = ['n', 'e', 'u'] 
     
-    #columns to include in creating the chunks, (offset and decay not really necessary, as crucial information already present in labels -> pay attention to not use this information in test data)
-    #available: ['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU', 'latitude', 'longitude', 'height', 'offset_value', 'offset_error', 'decay_value', 'decay_error', 'decay_tau', 'decay_type']
-    cols = ['N', 'E', 'U']
-
+    cols = USED_COLS
     for df in dfs:
-        # First step extract all features
-        
         # Extract basic features (displacement, errors, correlations)
         features = df[['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU']].copy()
         
@@ -347,10 +359,14 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
             # Add series to features
             for name, series in series_dict.items():
                 features[f'{comp}_{name}'] = series
+        
+        # Encode the longitude using cosine and sine to take into account that 0° and 360° refer to the same point
+        longitude_radians = np.radians(longitude)
+        features['sin_longitude'] = np.sin(longitude_radians)
+        features['cos_longitude'] = np.cos(longitude_radians)
 
-        # Add station metadata (location and height)
+        # Add other station metadata (location and height)
         features['latitude'] = latitude
-        features['longitude'] = longitude
         features['height'] = height
 
         # Create the feature matrix with chunking -> chunks are only created for the columns that were specified earlier in the cols variable
@@ -360,6 +376,7 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
             feature_matrix.append(feature_row)
             
             time_index.append(features.index[i])
+            station_names.append(df.name)
             
             offset_values_chunk = features[['n_offset_value', 'e_offset_value', 'u_offset_value']].iloc[i:i + chunk_size]
             
@@ -382,9 +399,9 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
                     target_vector.append(0)
 
     feature_matrix = np.array(feature_matrix)
-    return pd.DataFrame(feature_matrix), target_vector, time_index
+    return pd.DataFrame(feature_matrix), target_vector, time_index, station_names
 
-def save_csv(test_predictions, path):
+def save_csv(data, path):
     """
     Saves the test predictions to a CSV file.
 
@@ -397,7 +414,7 @@ def save_csv(test_predictions, path):
     Returns:
     None
     """
-    test_predictions.to_csv(path, index=True)
+    data.to_csv(path, index=True)
     
 def compute_weights(train_labels):
     """
@@ -417,7 +434,7 @@ def compute_weights(train_labels):
     class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=train_labels)
     return {c: w for c, w in zip(classes, class_weights)}
 
-def prepare_data(X, y, start_index, test_size=0.3, random_state=RANDOM_STATE):
+def prepare_data(X, y, start_index, stations, random_state=RANDOM_STATE):
     """
     Prepares training and testing data by splitting the feature matrix and target vector.
     Applies SMOTE to balance the training set.
@@ -435,8 +452,18 @@ def prepare_data(X, y, start_index, test_size=0.3, random_state=RANDOM_STATE):
     y_test (Series): Test set target vector.
     class_weights (dict): Weights for handling imbalanced classes.
     """
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test, _, test_start_index = train_test_split(X, y, start_index, test_size=test_size, random_state=random_state)
+    X_train, X_temp, y_train, y_temp, _, temp_start_index, _, temp_stations = train_test_split(
+        X, y, start_index, stations, test_size=0.3, random_state=random_state)
+
+    # Further split temp set into eval (10%) and test (20%)
+    X_eval, X_test, y_eval, y_test, _, test_start_index, _, test_stations = train_test_split(
+        X_temp, y_temp, temp_start_index, temp_stations, test_size=2/3, random_state=random_state)
+
+    # Scale the features
+    scaler = MinMaxScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_eval = scaler.transform(X_eval)
+    X_test = scaler.transform(X_test)
     
     # Oversample the minority classes to a random percentage between 10% and 40% of the majority class
     rng = np.random.default_rng(seed=RANDOM_STATE)
@@ -447,7 +474,7 @@ def prepare_data(X, y, start_index, test_size=0.3, random_state=RANDOM_STATE):
     sampling_strategy = {}
     for cls in class_counts:
         if cls != majority_class:
-            random_percentage = rng.uniform(0.20, 0.40)
+            random_percentage = rng.uniform(OVERSAMPLING_PERCENTAGES[0], OVERSAMPLING_PERCENTAGES[1])
             target_count = int(class_counts[majority_class] * random_percentage)
             sampling_strategy[cls] = target_count
     
@@ -457,7 +484,7 @@ def prepare_data(X, y, start_index, test_size=0.3, random_state=RANDOM_STATE):
     # Compute class weights to handle imbalanced dataset
     class_weights = compute_weights(y_train)
     
-    return X_train, X_test, y_train, y_test, class_weights, test_start_index
+    return X_train, X_eval, X_test, y_train, y_eval, y_test, class_weights, test_start_index, test_stations
 
 def random_forest(weights):
     """
@@ -538,7 +565,8 @@ def xgboost(y_train):
         random_state=BEST_PARAMS_XGBOOST['random_state'],
         objective=BEST_PARAMS_XGBOOST['objective'],
         eval_metric=BEST_PARAMS_XGBOOST['eval_metric'],
-        num_class=len(set(y_train))
+        num_class=len(set(y_train)),
+        early_stopping_rounds=15
     )
     return model
 
@@ -682,7 +710,7 @@ def optimize_hist_gradient_boosting(X_train, y_train, weights):
     
     return grid_search.best_estimator_
 
-def optimize_xgboost(X_train, y_train):
+def optimize_xgboost(X_train, y_train, X_eval, y_eval):
     """
     Optimizes an XGBoost classifier using grid search with cross-validation.
 
@@ -707,7 +735,7 @@ def optimize_xgboost(X_train, y_train):
     if OPTIMAL_PARAMS:
         print(f'Training XGBoost model using the specified optimal parameters: {BEST_PARAMS_XGBOOST}')
         model = xgboost(y_train)
-        return model.fit(X_train, y_train)
+        return model.fit(X_train, y_train, eval_set=[(X_eval, y_eval)], verbose=True)
     
     param_grid = {
         'n_estimators': [100, 300, 500],
@@ -805,11 +833,203 @@ def group_confusion_matrix(true_labels, predicted_labels, n_classes=21):
     
     return group_conf_matrix
 
-def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, X_test=None, model=None, tolerance_window=None):
+def plot_statistics(report, name):
+    # Extract precision, recall, and f1-score for each class
+    precision = []
+    recall = []
+    f1_score = []
+    class_labels = []
+
+    for i in range(21):
+        class_key = str(i)
+        
+        if class_key in report:
+            metrics = report[class_key]
+            if isinstance(metrics, dict):
+                precision.append(metrics.get('precision', 0))
+                recall.append(metrics.get('recall', 0))
+                f1_score.append(metrics.get('f1-score', 0))
+                class_labels.append(class_key)
+
+    plt.figure(figsize=(10, 6))
+    bar_width = 0.25
+    r1 = np.arange(len(precision))
+    r2 = [x + bar_width for x in r1]
+    r3 = [x + bar_width for x in r2]
+
+    plt.bar(r1, precision, color='b', width=bar_width, edgecolor='grey', label='Precision')
+    plt.bar(r2, recall, color='g', width=bar_width, edgecolor='grey', label='Recall')
+    plt.bar(r3, f1_score, color='r', width=bar_width, edgecolor='grey', label='F1-Score')
+
+    plt.xlabel('Classes', fontweight='bold')
+    plt.ylabel('Scores', fontweight='bold')
+    plt.xticks([r + bar_width for r in range(len(class_labels))], class_labels)
+
+    plt.title('Precision, Recall, and F1 Scores per Class')
+    plt.legend()
+    plt.tight_layout()
+    
+    plt.savefig(f'{PLOTS_PATH}_{name}.png')
+    plt.close()
+
+def plot_neu_data_with_labels_predictions(df, idx, name, zoom_window=10):
+    """
+    Plots the N, E, and U columns from a DataFrame with datetime index on the x-axis in separate subplots,
+    including 'labels_sum' and 'preds_sum' as bar plots in each subplot on a secondary y-axis,
+    with zoomed-in views around dates where 'labels_sum' > 0.
+
+    Parameters:
+    df (pd.DataFrame): The input DataFrame with columns 'N', 'E', 'U', 'labels_sum', 'preds_sum', and a datetime index.
+    idx (int): Index or identifier for the plot filename.
+    name (str): Name identifier for the plot filename.
+    zoom_window (int): Number of days before and after the event to zoom in on.
+    """
+    
+    df.index = pd.to_datetime(df.index)
+    fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle(f'Displacement and Earthquakes Over Time for Station: {df.name}', fontsize=16)
+
+    # Plot for 'N'
+    axs[0].plot(df.index, df['N'], color='blue', label='N')
+    ax2_n = axs[0].twinx()  # Create a secondary y-axis
+    ax2_n.bar(df.index, df['labels_sum'], width=1, color='gray', alpha=0.3, label='True Labels')
+    ax2_n.bar(df.index, df['preds_sum'], width=1, color='orange', alpha=0.3, label='Predictions')
+    axs[0].set_ylabel('N Displacement')
+    ax2_n.set_ylabel('Counts')
+    axs[0].legend(loc='upper left')
+    ax2_n.legend(loc='upper right')
+
+    # Plot for 'E'
+    axs[1].plot(df.index, df['E'], color='blue', label='E')
+    ax2_e = axs[1].twinx()  # Create a secondary y-axis
+    ax2_e.bar(df.index, df['labels_sum'], width=1, color='gray', alpha=0.3)
+    ax2_e.bar(df.index, df['preds_sum'], width=1, color='orange', alpha=0.3)
+    axs[1].set_ylabel('E Displacement')
+    ax2_e.set_ylabel('Counts')
+
+    # Plot for 'U'
+    axs[2].plot(df.index, df['U'], color='blue', label='U')
+    ax2_u = axs[2].twinx()  # Create a secondary y-axis
+    ax2_u.bar(df.index, df['labels_sum'], width=1, color='gray', alpha=0.3)
+    ax2_u.bar(df.index, df['preds_sum'], width=1, color='orange', alpha=0.3)
+    axs[2].set_ylabel('U Displacement')
+    ax2_u.set_ylabel('Counts')
+
+    axs[2].set_xlabel('Date')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}{idx}.png')
+    plt.close()
+
+    # Zoomed-In Plot(s)
+    zoom_dates = df[df['labels_sum'] > 0].index
+
+    for i, date in enumerate(zoom_dates):
+        start_date = date - pd.Timedelta(days=zoom_window)
+        end_date = date + pd.Timedelta(days=zoom_window)
+        zoom_df = df.loc[start_date:end_date]
+
+        fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        fig.suptitle(f'Zoomed Displacement and Earthquakes for Station {df.name} around {date.date()}', fontsize=16)
+
+        # Zoom for 'N'
+        axs[0].plot(zoom_df.index, zoom_df['N'], color='blue', label='N')
+        ax2_zoom_n = axs[0].twinx()  # Create a secondary y-axis
+        ax2_zoom_n.bar(zoom_df.index, zoom_df['labels_sum'], width=1, color='gray', alpha=0.3, label='True Labels')
+        ax2_zoom_n.bar(zoom_df.index, zoom_df['preds_sum'], width=1, color='orange', alpha=0.3, label='Predictions')
+        axs[0].set_ylabel('N Displacement')
+        ax2_zoom_n.set_ylabel('Counts')
+        axs[0].legend(loc='upper left')
+        ax2_zoom_n.legend(loc='upper right')
+
+        # Zoom for 'E'
+        axs[1].plot(zoom_df.index, zoom_df['E'], color='blue', label='E')
+        ax2_zoom_e = axs[1].twinx()  # Create a secondary y-axis
+        ax2_zoom_e.bar(zoom_df.index, zoom_df['labels_sum'], width=1, color='gray', alpha=0.3)
+        ax2_zoom_e.bar(zoom_df.index, zoom_df['preds_sum'], width=1, color='orange', alpha=0.3)
+        axs[1].set_ylabel('E Displacement')
+        ax2_zoom_e.set_ylabel('Counts')
+
+        # Zoom for 'U'
+        axs[2].plot(zoom_df.index, zoom_df['U'], color='blue', label='U')
+        ax2_zoom_u = axs[2].twinx()  # Create a secondary y-axis
+        ax2_zoom_u.bar(zoom_df.index, zoom_df['labels_sum'], width=1, color='gray', alpha=0.3)
+        ax2_zoom_u.bar(zoom_df.index, zoom_df['preds_sum'], width=1, color='orange', alpha=0.3)
+        axs[2].set_ylabel('U Displacement')
+        ax2_zoom_u.set_ylabel('Counts')
+
+        axs[2].set_xlabel('Date')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'{PLOTS_PATH}_{name}_zoom_{idx}_{i}.png')
+        plt.close()
+    
+    
+def dechunk_labels_predictions(dfs, chunk_size=21):
+    time_series = []
+    
+    for df in dfs:
+        df.index = pd.to_datetime(df.index)
+        start_date = df.index.min()
+        end_date = df.index.max() + pd.Timedelta(days=chunk_size - 1)
+        continuous_index = pd.date_range(start=start_date, end=end_date)
+
+        time_series_df = pd.DataFrame(index=continuous_index, columns=['labels_sum', 'preds_sum'], dtype='int64')
+        time_series_df.fillna(0, inplace=True)
+
+        for _, row in df.iterrows():
+            if row['labels']>0:
+                label_date = row.name + pd.Timedelta(days=row['labels']+1)
+                time_series_df.loc[label_date, 'labels_sum'] += 1
+            if row['preds']>0:
+                prediction_date = row.name + pd.Timedelta(days=row['preds']+1)
+                time_series_df.loc[prediction_date, 'preds_sum'] += 1
+
+        time_series_df.name = df.attrs['station']
+        time_series.append(time_series_df)
+
+    return time_series
+
+
+def combined_df(cleaned_dfs, dfs):
+    """
+    Combines cleaned DataFrames (with labels and predictions) with additional DataFrames
+    based on matching station names.
+
+    Parameters:
+    cleaned_dfs (list of pd.DataFrame): List of DataFrames containing labels and predictions.
+    dfs (list of pd.DataFrame): List of additional DataFrames with station information.
+
+    Returns:
+    list of pd.DataFrame: A list of combined DataFrames for each station.
+    """
+    total_dfs = []
+
+    # Create a dictionary for quick access to cleaned DataFrames by station name
+    cleaned_dict = {df.name: df for df in cleaned_dfs}
+
+    for additional_df in dfs:
+        station_name = additional_df.name
+        if station_name in cleaned_dict:
+            cleaned_df = cleaned_dict[station_name]
+            cleaned_df.index = pd.to_datetime(cleaned_df.index)
+            additional_df.index = pd.to_datetime(additional_df.index)
+
+            filtered_cleaned_df = cleaned_df.loc[cleaned_df.index.intersection(additional_df.index)]
+            combined_df = pd.concat([filtered_cleaned_df, additional_df.loc[filtered_cleaned_df.index]], axis=1)
+
+            combined_df.name=station_name
+            total_dfs.append(combined_df)
+
+    return total_dfs
+
+def evaluation(test_predictions, test_labels, cleaned_dfs, stations, start_indices, chunk_size=CHUNK_SIZE, X_test=None, model=None, tolerance_window=None):
     
     # To avoid overwriting the original predictions when applying a tolerance window
     original_test_predictions = test_predictions.copy()
     tolerance_str = f"_tolerance_{tolerance_window}" if tolerance_window is not None else "_default"
+    
+    print(f'Evaluation of performance for model: {MODEL_TYPE} using columns: {USED_COLS} \n')
     
     if MODEL_TYPE == 'IsolationForest':
         test_predictions = test_predictions.map({-1: 1, 1: 0})
@@ -822,32 +1042,30 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, X_test=None
         print(f"Confusion Matrix: \n{conf_matrix}")
         
         return original_test_predictions
-
+    
     if tolerance_window is not None:
-        print(f'Tolerance window is active, classifications that were missed by {tolerance_window} day(s) count as correctly classified.')
+        print(f'Tolerance window is active, classifications that were missed by {tolerance_window} day(s) count as correctly classified for earthquakes (class index > 0).')
         test_labels_np = test_labels.to_numpy()
         test_predictions_np = test_predictions.to_numpy()
-        
+
         for i in range(len(test_labels_np)):
-            # Check if misclassification occurs and adjust within tolerance window
-            if test_labels_np[i] != test_predictions_np[i]:
-                for offset in range(-tolerance_window, tolerance_window + 1):
-                    if 0 <= i + offset < len(test_labels_np):
-                        if test_labels_np[i + offset] == test_predictions_np[i]:
-                            test_predictions_np[i] = test_labels_np[i]
-                            break
+            # Check if the actual label is an earthquake (index > 0) and it was misclassified
+            if test_labels_np[i] > 0 and test_predictions_np[i] != test_labels_np[i]:
+                if abs(test_predictions_np[i] - test_labels_np[i]) <= tolerance_window:
+                    test_predictions_np[i] = test_labels_np[i]
 
         test_predictions = pd.Series(test_predictions_np, index=test_labels.index)
 
     report = classification_report(test_labels, test_predictions)
-    print(f'Evaluation of performance for model: {MODEL_TYPE} \n')
     print(f'Multi-Class Classification Report: \n {report} \n')
+    plot_statistics(classification_report(test_labels, test_predictions, output_dict=True), f'statistics{tolerance_str}')
     
     conf_matrix = group_confusion_matrix(test_labels, test_predictions)
     print(f"Grouped Confusion Matrix by date of earthquake (No, Early, Middle, Late): \n{conf_matrix} \n")
-
+    if isinstance(test_labels, list):
+        test_labels = pd.Series(test_labels, index=test_labels.index)
     plot_histogram(test_predictions.value_counts().subtract(test_labels.value_counts(), fill_value=0), 'Chunk Index', 'Difference (Predicted - True)', 'Difference between predicted and actual earthquakes at chunk indices', f'hist_predtest{tolerance_str}')
-
+    
     false_positive_rate = np.sum((test_predictions == 1) & (test_labels == 0)) / np.sum(test_labels == 0)
     false_negative_rate = np.sum((test_predictions == 0) & (test_labels == 1)) / np.sum(test_labels == 1)
 
@@ -946,13 +1164,26 @@ def evaluation(test_predictions, test_labels, chunk_size=CHUNK_SIZE, X_test=None
 
     if model is not None and hasattr(model, 'feature_importances_'):
         feature_importances = model.feature_importances_
-        num_features = 3
+        num_features = len(USED_COLS)
         averaged_importances = np.mean(feature_importances.reshape(-1, num_features), axis=0)
-        print(f"Averaged Feature Importances (Displacement in N, E, U): {averaged_importances}")
+        print(f"Averaged Feature Importances for used columns {USED_COLS}: \n{averaged_importances}")
+        
+    time_series = pd.concat([pd.Series(stations, index=start_indices, name='stations'), pd.Series(test_labels, index=start_indices, name='labels'), pd.Series(test_predictions, index=start_indices, name='preds')], axis=1)
+    time_series = [group for _, group in time_series.groupby('stations')]
+    for i, df in enumerate(time_series):
+        df.attrs['station'] = df['stations'].iloc[0]
+        df.drop(columns=['stations'], inplace=True)
+        df.sort_index(inplace=True)
+    dfs = dechunk_labels_predictions(time_series)
+    
+    total_df = combined_df(cleaned_dfs, dfs)
+    rng = np.random.default_rng(seed=RANDOM_STATE)
+    for idx in range(10):
+        plot_neu_data_with_labels_predictions(total_df[rng.integers(0, len(total_df))], idx=idx, name=f'comp_preds{tolerance_str}')
         
     return original_test_predictions
 
-def train_model(X, y, start_index, model_type):
+def train_model(X, y, start_index, stations, model_type, cleaned_dfs):
     """
     Trains a model based on the specified type using both North, East, and Up component data.
 
@@ -966,35 +1197,37 @@ def train_model(X, y, start_index, model_type):
     report: Classification report for the test set.
     """
     
-    X_train, X_test, train_labels, test_labels, weights, test_start_index = prepare_data(X, y, start_index)
+    X_train, X_eval, X_test, y_train, y_eval, y_test, weights, test_start_index, test_stations = prepare_data(X, y, start_index, stations)
 
     if model_type == 'IsolationForest':
-        model = optimize_isolation_forest(X_train, train_labels)
+        model = optimize_isolation_forest(X_train, y_train)
         test_predictions = model.predict(X_test)
         
     elif model_type == 'RandomForest':
-        model = optimize_random_forest(X_train, train_labels, weights)
+        model = optimize_random_forest(X_train, y_train, weights)
         test_predictions = model.predict(X_test)
     
     elif model_type == 'HistGradientBoosting':
-        model = optimize_hist_gradient_boosting(X_train, train_labels, weights)
+        model = optimize_hist_gradient_boosting(X_train, y_train, weights)
         test_predictions = model.predict(X_test)
         
     elif model_type == 'XGBoost':
-        model = optimize_xgboost(X_train, train_labels)
+        model = optimize_xgboost(X_train, y_train, X_eval, y_eval)
         test_predictions = model.predict(X_test)
         
     else:
         raise ValueError('Used Model Type not implemented. Please control spelling!')
     
     test_predictions = pd.Series(test_predictions, index=test_start_index)
-    test_labels = pd.Series(test_labels, index=test_start_index)
+    test_labels = pd.Series(y_test, index=test_start_index)
+    test_stations = pd.Series(test_stations, index=test_start_index)
     
     joblib.dump(model, MODEL_PATH)
     save_csv(test_predictions, PREDICTIONS_PATH)
     save_csv(test_labels, TEST_LABELS_PATH)
+    save_csv(test_stations, STATION_NAMES)
     for window in [None, 1]:
-        test_predictions = evaluation(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window)
+        test_predictions = evaluation(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window, cleaned_dfs=cleaned_dfs, stations=test_stations, start_indices=test_start_index)
 
 
 def main():
@@ -1022,14 +1255,17 @@ def main():
 
     cleaned_dfs = clean_dataframes(dfs, missing_value_threshold=0, limited_period=True, minimal_offset=10)
     
+    df_dict = {f'df_{i}': df for i, df in enumerate(cleaned_dfs)}
+    pd.to_pickle(df_dict, CLEANED_DATA_PATH)
+    
     # HistGradientBoosting designed to deal with None data -> No interpolation needed
     interpolate = False if MODEL_TYPE == 'HistGradientBoosting' else True
-    X, y, start_index = extract_features(cleaned_dfs, interpolate=interpolate)
+    X, y, start_index, stations = extract_features(cleaned_dfs, interpolate=interpolate)
     
     X.to_csv(f'{FEATURES_PATH}_features.csv', index=True)
     pd.Series(y).to_csv(f'{FEATURES_PATH}_target.csv', index=False, header=False)
     
-    train_model(X, y, start_index, model_type=MODEL_TYPE)
+    train_model(X, y, start_index, stations, model_type=MODEL_TYPE, cleaned_dfs=cleaned_dfs)
 
 if __name__=='__main__':
     main()
