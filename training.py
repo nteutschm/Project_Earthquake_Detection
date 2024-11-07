@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import pandas as pd
+import geopandas as gpd
 import numpy as np
 import re
 from shapely.geometry import Point
@@ -9,21 +10,30 @@ from pathlib import Path
 from collections import Counter
 import joblib
 from sklearn.ensemble import IsolationForest, HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_fscore_support
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_fscore_support, f1_score
 from xgboost import XGBClassifier, callback
 from imblearn.over_sampling import SMOTE
 import matplotlib.pyplot as plt
+import contextily as ctx
 import seaborn as sns
 import sys
+import optuna
+from optuna.visualization.matplotlib import plot_optimization_history, plot_param_importances, plot_contour
+
+# Runs in the backgound:
+import optuna.integration # pip install optuna-integration[xgboost]
+
+pd.options.mode.chained_assignment = None
+
 
 DATA_PATH = '/cluster/home/nteutschm/eqdetection/data/'
-RANDOM_STATE = 47
+RANDOM_STATE = 61
 # Available: IsolationForest HistGradientBoosting RandomForest XGBoost
-MODEL_TYPE = 'XGBoost'
+MODEL_TYPE = 'RandomForest'
 
 MODEL_PATH = f'/cluster/scratch/nteutschm/eqdetection/models/{MODEL_TYPE}.pkl'
 PREDICTIONS_PATH = f'/cluster/scratch/nteutschm/eqdetection/predictions/{MODEL_TYPE}.csv'
@@ -32,17 +42,18 @@ FEATURES_PATH = f'/cluster/scratch/nteutschm/eqdetection/features/{MODEL_TYPE}'
 STATION_NAMES = f'/cluster/scratch/nteutschm/eqdetection/stations/{MODEL_TYPE}.csv'
 PLOTS_PATH = f'/cluster/scratch/nteutschm/eqdetection/plots/{MODEL_TYPE}'
 CLEANED_DATA_PATH = f'/cluster/scratch/nteutschm/eqdetection/data/dfs.pkl'
+STUDIES = f'/cluster/scratch/nteutschm/eqdetection/studies/{MODEL_TYPE}.pkl'
 
 # Stores all print information
 LOG_FILE = f'/cluster/home/nteutschm/eqdetection/logs/{MODEL_TYPE}_logs.txt'
 
-LOAD_MODEL = True # If already trained model is saved under MODEL_PATH, it can be loaded if set to True to skip the entire training process
+LOAD_MODEL = False # If already trained model is saved under MODEL_PATH, it can be loaded if set to True to skip the entire training process
 
 #columns to include in creating the chunks, (offset and decay not really necessary, as crucial information already present in labels)
 #available: ['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU', 'latitude', 'cos_longitude', 'sin_longitude', 'height', 'offset_value', 'offset_error', 'decay_value', 'decay_error', 'decay_tau', 'decay_type']
-USED_COLS = ['N', 'E', 'U']
+USED_COLS = ['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU', 'latitude', 'cos_longitude', 'sin_longitude', 'height']
 
-OPTIMAL_PARAMS = True # If optimal parametrs should be used to train the model, or the parameters should be tuned (set to False)
+OPTIMAL_PARAMS = False # If optimal parametrs should be used to train the model, or the parameters should be tuned (set to False)
 
 # How much percentage (expressed between 0 and 1) of the majority class the minority classes should be (lower end, upper end)
 OVERSAMPLING_PERCENTAGES = (0.3, 0.5)
@@ -79,14 +90,24 @@ BEST_PARAMS_HIST_GRADIENT_BOOSTING = {
     'validation_fraction': 0.1
 }
 
+
 BEST_PARAMS_XGBOOST = {
-    'n_estimators': 500,
-    'max_depth': 10,
-    'learning_rate': 0.1,
+    'n_estimators': 493, 
+    'max_depth': 20, 
+    'learning_rate': 0.13353757064419783, 
+    'subsample': 0.8734517481859924, 
+    'colsample_bytree': 0.7266943177706023, 
+    'gamma': 0.0008884960416922771, 
+    'min_child_weight': 1, 
+    'max_delta_step': 2, 
     'random_state': RANDOM_STATE,
     'objective': 'multi:softprob',
-    'eval_metric': 'mlogloss'
-}
+    'eval_metric': 'mlogloss'}
+
+BEST_PARAMS_XGBOOST = {'n_estimators': 204, 'max_depth': 7, 'learning_rate': 0.03297805658471294, 
+                       'subsample': 0.64782202714359, 'colsample_bytree': 0.614915400500874, 
+                       'gamma': 2.4165973400576046, 'min_child_weight': 7, 'max_delta_step': 7,
+                       'random_state': RANDOM_STATE, 'objective': 'multi:softprob', 'eval_metric': 'mlogloss'}
 
 def get_offsets(header_lines):
     """
@@ -302,9 +323,28 @@ def clean_dataframes(dfs, missing_value_threshold=None, limited_period=False, mi
             continue
 
         # Trim data to include the range around the coseismic offsets if days_included is provided
+        # Data can not be interpolated if there are None values at the edges -> Prevent this
         if first_coseismic_date and limited_period:
             start_date = first_coseismic_date - pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
             end_date = last_coseismic_date + pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
+            start_date = max(start_date, df.index[0])
+            end_date = min(end_date, df.index[-1])
+
+            while start_date <= first_coseismic_date - pd.Timedelta(days=NBR_OF_DAYS[0]):
+                if pd.isna(df.loc[start_date.strftime('%Y-%m-%d')]).any():
+                    start_date = start_date + pd.Timedelta(days=1) 
+                else:
+                    break
+            else:
+                continue
+
+            while end_date >= last_coseismic_date + pd.Timedelta(days=NBR_OF_DAYS[0]):
+                if pd.isna(df.loc[end_date.strftime('%Y-%m-%d')]).any():
+                    end_date = end_date - pd.Timedelta(days=1)
+                else:
+                    break
+            else:
+                continue
             df = df[(df.index >= start_date) & (df.index <= end_date)]
 
         # Check missing values for all components combined, if threshold is provided
@@ -338,6 +378,7 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
     time_index = []
     station_names = []
     components_offsets = ['n', 'e', 'u'] 
+    geometries = []
     
     cols = USED_COLS
     for df in dfs:
@@ -390,6 +431,7 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
             
             time_index.append(features.index[i])
             station_names.append(df.name)
+            geometries.append(df.attrs.get('geometry'))
             
             offset_values_chunk = features[['n_offset_value', 'e_offset_value', 'u_offset_value']].iloc[i:i + chunk_size]
             
@@ -405,19 +447,22 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
                 # Otherwise actually save the index of when the earthquake occured as well (using the mean over each row to detect the biggest earthquake in the chunk):
                 max_mean_index = offset_values_chunk.abs().mean(axis=1).idxmax()
                 target_vector.append(offset_values_chunk.index.get_loc(max_mean_index))
-    feature_matrix = np.array(feature_matrix)
-    return pd.DataFrame(feature_matrix), target_vector, time_index, station_names
 
-def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclusion_range=(-5, 5), random_state=RANDOM_STATE):
+    return pd.DataFrame(np.array(feature_matrix)), target_vector, time_index, station_names, geometries
+
+def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclusion_range=(-10, 10), decay_rate_range=(0.01, 0.1), noise_level=0.5, random_state=RANDOM_STATE):
     """
-    Generates synthetic test data by adding random offsets to selected non-coseismic dataframes.
+    Generates synthetic test data by adding random offsets with random decay and noise to selected dataframes.
     
     Parameters:
     dfs (list): List of dataframes to process.
     num_series (int, optional): Number of dataframes to modify by adding synthetic offsets.
-    offset_range (tuple): The full range (min, max) for the offsets to be generated.
+    offset_range (tuple): Full range (min, max) for the offsets to be generated.
     exclusion_range (tuple): Range (min, max) to exclude from one of the offsets.
+    decay_rate_range (tuple): Range (min, max) for decay rate.
+    noise_level (float): Standard deviation of Gaussian noise to add to the offset.
     random_state (int, optional): Seed for random number generator for reproducibility.
+    
     Returns:
     list: List of dataframes with added synthetic offsets.
     """
@@ -434,6 +479,7 @@ def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclu
             offset = rng.uniform(*offset_range)
             if offset < exclusion_range[0] or offset > exclusion_range[1]:
                 return offset
+            
     selected_dfs = rng.choice(np.asarray(dfs, dtype='object'), size=num_series, replace=False)
     for df in selected_dfs:
         random_date = rng.choice(df.index)
@@ -444,11 +490,16 @@ def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclu
         outlier_component = rng.choice(components)
         
         synthetic_offsets = {}
+        decay_info = {}
         for comp in components:
             if comp == outlier_component:
                 synthetic_offsets[comp] = generate_outside_exclusion()
             else:
                 synthetic_offsets[comp] = generate_within_exclusion()
+            decay_info[comp] = {
+                'type': rng.choice(['exponential', 'logarithmic']),
+                'rate': rng.uniform(*decay_rate_range)
+            }
         
         # Apply offsets to the displacement columns starting from the random date
         for comp, cm in zip(components, comps):
@@ -456,17 +507,41 @@ def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclu
             start_date = random_date - pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
             end_date = random_date + pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
             df = df[(df.index >= start_date) & (df.index <= end_date)]
-            df.loc[random_date:, cm] += offset_value
+            decay_type = decay_info[comp]['type']
+            decay_rate = decay_info[comp]['rate']
+            
+            time_span = (df.index >= random_date) & (df.index <= min(random_date + pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1])), df.index[-1]))
+            decay_period = np.arange(sum(time_span))
+            
+            if decay_type == 'exponential':
+                decayed_values = offset_value * np.exp(-decay_rate * decay_period)
+            elif decay_type == 'logarithmic':
+                decayed_values = offset_value / (1 + decay_rate * decay_period)
+            
+            # Add Gaussian noise
+            noise = rng.normal(0, noise_level, size=len(decayed_values))
+            decayed_values += noise
+            
+            df.loc[time_span, cm] += decayed_values
             
             if 'offsets' not in df.attrs:
                 df.attrs['offsets'] = {c: {'offsets': [], 'ps_decays': []} for c in components}
+            
             df.attrs['offsets'][comp]['offsets'].append({
                 'date': random_date,
                 'value': offset_value,
-                'error': 0.0, 
-                'coseismic': True, 
+                'error': noise_level,
+                'coseismic': True
             })
-            df.attrs['offsets'][comp]['ps_decays'] = [{'date': random_date, 'value': 0, 'error': 0, 'tau': 0, 'type': ''}]
+            
+            df.attrs['offsets'][comp]['ps_decays'].append({
+                'date': random_date,
+                'value': 0,
+                'error': noise_level,
+                'tau': decay_rate,
+                'type': decay_type
+            })
+        
         df.name = name
         synthetic_dfs.append(df)
     return synthetic_dfs
@@ -504,30 +579,59 @@ def compute_weights(train_labels):
     class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=train_labels)
     return {c: w for c, w in zip(classes, class_weights)}
 
-def prepare_data(X, y, start_index, stations, random_state=RANDOM_STATE):
+def prepare_data(X, y, start_index, stations, geometries, random_state=RANDOM_STATE):
     """
-    Prepares training and testing data by splitting the feature matrix and target vector.
-    Applies SMOTE to balance the training set.
+    Prepares training, evaluation, and testing data by splitting based on stations,
+    so that no station appears in more than one set.
 
     Parameters:
     X (DataFrame): The feature matrix (chunked GNSS data).
     y (list or Series): The target labels (multiclass).
-    test_size (float): Proportion of the dataset to include in the test split.
+    start_index (list): Start index for each sample in `X`.
+    stations (list): Station names associated with each sample.
     random_state (int): Random seed for reproducibility.
+    oversampling_percentages (tuple): Range of percentages to oversample minority classes.
 
     Returns:
-    X_train (DataFrame): Training set feature matrix.
-    X_test (DataFrame): Test set feature matrix.
-    y_train (Series): Training set target vector.
-    y_test (Series): Test set target vector.
-    class_weights (dict): Weights for handling imbalanced classes.
+    X_train, X_eval, X_test, y_train, y_eval, y_test, class_weights, test_start_index, test_stations
     """
-    X_train, X_temp, y_train, y_temp, _, temp_start_index, _, temp_stations = train_test_split(
-        X, y, start_index, stations, test_size=0.3, random_state=random_state)
+    unique_stations = list(set(stations))
+    np.random.seed(random_state)
+    np.random.shuffle(unique_stations)
+    n_train = int(0.7 * len(unique_stations))
+    n_eval = int(0.1 * len(unique_stations))
+    
+    train_stations = unique_stations[:n_train]
+    eval_stations = unique_stations[n_train:n_train + n_eval]
+    test_stations_unique = unique_stations[n_train + n_eval:]
 
-    # Further split temp set into eval (10%) and test (20%)
-    X_eval, X_test, y_eval, y_test, _, test_start_index, _, test_stations = train_test_split(
-        X_temp, y_temp, temp_start_index, temp_stations, test_size=2/3, random_state=random_state)
+    # Create masks based on station allocations
+    train_mask = [s in train_stations for s in stations]
+    eval_mask = [s in eval_stations for s in stations]
+    test_mask = [s in test_stations_unique for s in stations]
+
+    # Filter data based on masks
+    X_train, y_train, _, geometries_train = (
+        X[train_mask],
+        [y[i] for i in range(len(y)) if train_mask[i]],
+        [start_index[i] for i in range(len(start_index)) if train_mask[i]],
+        [geometries[i] for i in range(len(geometries)) if train_mask[i]]
+    )
+    X_eval, y_eval, _, geometries_eval = (
+        X[eval_mask],
+        [y[i] for i in range(len(y)) if eval_mask[i]],
+        [start_index[i] for i in range(len(start_index)) if eval_mask[i]],
+        [geometries[i] for i in range(len(geometries)) if eval_mask[i]]
+    )
+    X_test, y_test, test_start_index, geometries_test = (
+        X[test_mask],
+        [y[i] for i in range(len(y)) if test_mask[i]],
+        [start_index[i] for i in range(len(start_index)) if test_mask[i]],
+        [geometries[i] for i in range(len(geometries)) if test_mask[i]]
+    )
+
+    # Get stations for each test sample (not unique)
+    test_stations = [stations[i] for i in range(len(stations)) if test_mask[i]]
 
     # Scale the features
     scaler = MinMaxScaler()
@@ -554,7 +658,29 @@ def prepare_data(X, y, start_index, stations, random_state=RANDOM_STATE):
     # Compute class weights to handle imbalanced dataset
     class_weights = compute_weights(y_train)
     
-    return X_train, X_eval, X_test, y_train, y_eval, y_test, class_weights, test_start_index, test_stations
+    return X_train, X_eval, X_test, y_train, y_eval, y_test, class_weights, test_start_index, test_stations, (geometries_train, geometries_eval, geometries_test)
+
+def print_callback(study, trial):
+    '''Print some useful information regarding the hyperparameter optimization'''
+    print(f"Current value: {trial.value}, Current params: {trial.params}")
+    print(f"Best value: {study.best_value}, Best params: {study.best_trial.params}")
+    print('-----------------------------------------------------------------------')
+
+def plot_eval_metrics(eval_results, name):
+    epochs = len(eval_results['validation_0']['mlogloss'])
+    x_axis = range(epochs)
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(x_axis, eval_results['validation_0']['mlogloss'], label='Train')
+    ax.plot(x_axis, eval_results['validation_1']['mlogloss'], label='Eval')
+    ax.set_title('XGBoost Log Loss Over Epochs')
+    ax.set_xlabel('Epochs')
+    ax.set_ylabel('Log Loss')
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png')
+    plt.close()
 
 def random_forest(weights):
     """
@@ -562,7 +688,7 @@ def random_forest(weights):
 
     This function initializes a RandomForestClassifier using pre-defined optimal 
     parameters stored in the BEST_PARAMS_RANDOM_FOREST variable. These parameters 
-    are expected to be set prior to calling this function. 
+    are expected to be set prior to calling this function.
 
     Returns:
     RandomForestClassifier: A Random Forest model with optimal settings.
@@ -570,8 +696,11 @@ def random_forest(weights):
     model = RandomForestClassifier(
         n_estimators=BEST_PARAMS_RANDOM_FOREST['n_estimators'],
         max_depth=BEST_PARAMS_RANDOM_FOREST['max_depth'],
-        class_weight=weights,#BEST_PARAMS_RANDOM_FOREST['class_weight'],
-        random_state=BEST_PARAMS_RANDOM_FOREST['random_state']
+        max_features=BEST_PARAMS_RANDOM_FOREST['max_features'],
+        min_samples_split=BEST_PARAMS_RANDOM_FOREST['min_samples_split'],
+        min_samples_leaf=BEST_PARAMS_RANDOM_FOREST['min_samples_leaf'],
+        class_weight=weights,
+        random_state=RANDOM_STATE
     )
     return model
 
@@ -628,60 +757,131 @@ def xgboost(y_train):
     Returns:
     XGBClassifier: An XGBoost model with optimal settings.
     """
+    cb = callback.EarlyStopping(rounds=10,
+            min_delta=1e-4,
+            save_best=True,
+            maximize=False,
+            data_name="validation_1",
+            metric_name="mlogloss")
     model = XGBClassifier(
         n_estimators=BEST_PARAMS_XGBOOST['n_estimators'],
         max_depth=BEST_PARAMS_XGBOOST['max_depth'],
         learning_rate=BEST_PARAMS_XGBOOST['learning_rate'],
+        subsample=BEST_PARAMS_XGBOOST['subsample'],
+        colsample_bytree=BEST_PARAMS_XGBOOST['colsample_bytree'],
+        gamma=BEST_PARAMS_XGBOOST['gamma'],
+        min_child_weight=BEST_PARAMS_XGBOOST['min_child_weight'],
+        max_delta_step=BEST_PARAMS_XGBOOST['max_delta_step'],
         random_state=BEST_PARAMS_XGBOOST['random_state'],
         objective=BEST_PARAMS_XGBOOST['objective'],
         eval_metric=BEST_PARAMS_XGBOOST['eval_metric'],
-        num_class=len(set(y_train)),
-        early_stopping_rounds=15
+        num_class=len(set(y_train)), 
+        callbacks=[cb]
     )
     return model
 
-def optimize_random_forest(X_train, y_train, weights):
+def optimize_random_forest(X_train, y_train, X_eval, y_eval, weights):
     """
-    Optimizes a Random Forest classifier using grid search with cross-validation.
-
-    The function first checks if a pre-trained model should be loaded based on the 
-    LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
-    specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
-    optimal parameters for training. Otherwise, it will perform grid search to 
-    identify the best hyperparameters.
+    Optimizes a RandomForest classifier using Optuna for hyperparameter tuning.
 
     Parameters:
     X_train (DataFrame): The training set feature matrix.
-    y_train (Series): The training set target vector (0 for no offset, 1 for offset).
-    weights (dict): Class weights to handle imbalanced classes.
+    y_train (Series): The training set target vector.
+    X_eval (DataFrame): The evaluation set feature matrix.
+    y_eval (Series): The evaluation set target vector.
 
     Returns:
-    RandomForestClassifier: The best Random Forest model after optimization.
+    RandomForestClassifier: The best RandomForest model after optimization.
     """
+
     if LOAD_MODEL:
-        print(F'Loading Random Forest model from: {MODEL_PATH}')
+        print(f'Loading Random Forest model from: {MODEL_PATH}')
         return joblib.load(MODEL_PATH)
     
     if OPTIMAL_PARAMS:
-        print(f'Training Random Forest model using the specified optimal parameters: {BEST_PARAMS_RANDOM_FOREST}')
+        print(f'Training RandomForest model using the specified optimal parameters: {BEST_PARAMS_RANDOM_FOREST}')
         model = random_forest(weights)
-        return OneVsRestClassifier(model).fit(X_train, y_train)
+        X_combined = pd.concat([X_train, X_eval])
+        y_combined = pd.concat([y_train, y_eval])
+        model.fit(X_combined, y_combined)
+        return model
     
-    #If we are using OneVsRestClassifier, we need to specify that the searched parameters are meant for the estimator as OneVsRestClassifier lacks most of these
-    param_grid = {
-        'estimator__n_estimators': [100, 300, 500],
-        'estimator__max_depth': [10, 30, 50],
-        'estimator__class_weight': [weights], 
-        'estimator__random_state': [RANDOM_STATE]
-    }
-    rf = OneVsRestClassifier(RandomForestClassifier())
-    stratified_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    grid_search = GridSearchCV(rf, param_grid, cv=stratified_cv, scoring='f1_weighted', verbose=3, n_jobs=-1, pre_dispatch='2*n_jobs')
-    grid_search.fit(X_train, y_train)
+    def objective(trial):
+        # Suggest values for the hyperparameters
+        n_estimators = trial.suggest_int('n_estimators', 100, 500)  # Number of trees in the forest
+        max_depth = trial.suggest_int('max_depth', 5, 30)  # Depth of the trees
+        min_samples_split = trial.suggest_int('min_samples_split', 2, 20)  # Min samples required to split
+        min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 10)  # Min samples at each leaf node
+        max_features = trial.suggest_categorical('max_features', ['sqrt', 'log2'])  # Number of features to consider at each split
+        bootstrap = trial.suggest_categorical('bootstrap', [True, False])  # Whether to use bootstrapped samples
+        criterion = trial.suggest_categorical('criterion', ['gini', 'entropy'])  # Splitting criterion
+
+        # Initialize RandomForestClassifier with suggested hyperparameters
+        model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            max_features=max_features,
+            bootstrap=bootstrap,
+            criterion=criterion,
+            random_state=RANDOM_STATE,
+            class_weight=weights,
+            n_jobs=-1
+        )
+        
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_eval)
+        f1_macro = f1_score(y_eval, y_pred, average='macro')  # Use macro F1 score for balanced evaluation
+        return f1_macro
     
-    print("Best RandomForest parameters found: ", grid_search.best_params_)
+    # Create an Optuna study and optimize
+    sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
+    study = optuna.create_study(direction='maximize', sampler=sampler)
+    study.optimize(objective, n_trials=30, callbacks=[print_callback], gc_after_trial=True)
     
-    return grid_search.best_estimator_
+    joblib.dump(study, STUDIES)
+    print("Best Random Forest parameters found: ", study.best_params)
+    
+    ax = plot_optimization_history(study, target_name='Validation loss')
+    ax.set_xlabel('Trial', fontsize=20)
+    ax.set_ylabel('Validation loss (Macro F1 Score)', fontsize=20)
+    ax.set_title('Optimization history', fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(prop={'size': 14})
+    plt.tight_layout()
+    plt.savefig(PLOTS_PATH+'optimization_history.png')
+    
+    ax = plot_param_importances(study)
+    ax.set_xlabel('Importance for validation loss', fontsize=20)
+    ax.set_ylabel('Hyperparameter', fontsize=20)
+    ax.set_title('Hyperparameter Importances', fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(prop={'size': 14})
+    plt.tight_layout()
+    plt.savefig(PLOTS_PATH+'parameter_importances.png')
+    
+    ax = plot_contour(study, params=['n_estimators', 'max_depth'], target_name='Validation loss')
+    ax.set_xlabel('Estimators', fontsize=20)
+    ax.set_ylabel('Max depth', fontsize=20)
+    ax.set_title('Contour plot', fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(prop={'size': 20})
+    plt.tight_layout()
+    plt.savefig(PLOTS_PATH+'contour.png')
+    
+    best_params = study.best_params
+    best_model = RandomForestClassifier(
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        class_weight=weights,
+        **best_params
+    )
+    X_combined = pd.concat([X_train, X_eval])
+    y_combined = pd.concat([y_train, y_eval])
+    
+    best_model.fit(X_combined, y_combined)
+    return best_model
 
 def optimize_isolation_forest(X_train, y_train):
     """
@@ -779,76 +979,143 @@ def optimize_hist_gradient_boosting(X_train, y_train, weights):
     print("Best HistGradientBoosting parameters found: ", grid_search.best_params_)
     
     return grid_search.best_estimator_
-
-def plot_eval_metrics(eval_results, name):
-    epochs = len(eval_results['validation_0']['mlogloss'])
-    x_axis = range(0, epochs)
     
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.plot(x_axis, eval_results['validation_0']['mlogloss'], label='Train')
-    ax.plot(x_axis, eval_results['validation_1']['mlogloss'], label='Eval')
-    ax.set_title('XGBoost Log Loss Over Epochs')
-    ax.set_xlabel('Epochs')
-    ax.set_ylabel('Log Loss')
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(f'{PLOTS_PATH}_{name}.png')
-    plt.close()
-
 def optimize_xgboost(X_train, y_train, X_eval, y_eval):
     """
-    Optimizes an XGBoost classifier using grid search with cross-validation.
+    Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
 
     The function first checks if a pre-trained model should be loaded based on the 
     LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
     specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
-    optimal parameters for training. Otherwise, it will perform grid search to 
+    optimal parameters for training. Otherwise, it will perform Optuna optimization to 
     identify the best hyperparameters.
 
     Parameters:
     X_train (DataFrame): The training set feature matrix.
-    y_train (Series): The training set target vector (0 for no offset, 1 for offset).
-    weights (dict): Class weights to handle imbalanced classes.
+    y_train (Series): The training set target vector.
+    X_eval (DataFrame): The evaluation set feature matrix.
+    y_eval (Series): The evaluation set target vector.
 
     Returns:
     XGBClassifier: The best XGBoost model after optimization.
     """
+
     if LOAD_MODEL:
-        print(F'Loading XGBoost model from: {MODEL_PATH}')
+        print(f'Loading XGBoost model from: {MODEL_PATH}')
         return joblib.load(MODEL_PATH)
     
     if OPTIMAL_PARAMS:
         print(f'Training XGBoost model using the specified optimal parameters: {BEST_PARAMS_XGBOOST}')
         model = xgboost(y_train)
-        eval_results = {}
-        model.fit(X_train, y_train, eval_set=[(X_eval, y_eval)], verbose=True, callbacks=[callback.EvaluationMonitor(logger=eval_results)])
-        plot_eval_metrics(eval_results, 'eval_scores')
+        X_combined = pd.concat([X_train, X_eval])
+        y_combined = pd.concat([y_train, y_eval])
+        model.fit(X_combined, y_combined, verbose=True)
         return model
     
-    param_grid = {
-        'n_estimators': [100, 300, 500],
-        'max_depth': [5, 10, 15, 30],
-        'learning_rate': [0.01, 0.1, 0.2],
-        'random_state': [RANDOM_STATE]
-    }
-    
-    xgb = XGBClassifier(objective='multi:softprob', eval_metric='mlogloss', num_class=len(set(y_train)))
+    # Define the Optuna objective function
+    def objective(trial):
+        # Suggest values for the hyperparameters
+        n_estimators = trial.suggest_int('n_estimators', 100, 500)
+        max_depth = trial.suggest_int('max_depth', 5, 30)
+        learning_rate = trial.suggest_float('learning_rate', 0.01, 0.2, log=True)
+        subsample = trial.suggest_float('subsample', 0.6, 1.0)
+        colsample_bytree = trial.suggest_float('colsample_bytree', 0.6, 1.0)
+        gamma = trial.suggest_float('gamma', 0, 5)
+        min_child_weight = trial.suggest_int('min_child_weight', 1, 10)
+        max_delta_step = trial.suggest_int('max_delta_step', 0, 10)
+        
+        cb = callback.EarlyStopping(rounds=10,
+            min_delta=1e-4,
+            save_best=True,
+            maximize=False,
+            data_name="validation_0",
+            metric_name="mlogloss")
+        
+        pruning = optuna.integration.XGBoostPruningCallback(trial, "validation_0-mlogloss")
+        
+        # Initialize XGBClassifier with suggested hyperparameters
+        xgb = XGBClassifier(
+            objective='multi:softprob',
+            eval_metric='mlogloss',
+            num_class=len(set(y_train)),
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            gamma=gamma,
+            min_child_weight=min_child_weight,
+            max_delta_step=max_delta_step,
+            callbacks=[pruning, cb],
+            random_state=RANDOM_STATE
+        )
+        
+        xgb.fit(X_train, y_train,
+                eval_set=[(X_eval, y_eval)],
+                verbose=False)
 
-    stratified_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    grid_search = GridSearchCV(
-        estimator=xgb,
-        param_grid=param_grid,
-        cv=stratified_cv,
-        scoring='f1_weighted',
-        verbose=1,
-        n_jobs=-1,
-        pre_dispatch='2*n_jobs'
+        # Evaluate with macro F1 score to balance all classes equally
+        y_pred = xgb.predict(X_eval)
+        f1_macro = f1_score(y_eval, y_pred, average='macro')
+        return f1_macro
+    
+    # Create an Optuna study and optimize
+    sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
+    study = optuna.create_study(direction='maximize', sampler=sampler)
+    study.optimize(objective, n_trials=30, callbacks=[print_callback], gc_after_trial=True)
+    
+    joblib.dump(study, STUDIES)
+    print("Best XGBoost parameters found: ", study.best_params)
+    
+    ax = plot_optimization_history(study, target_name='Validation loss')
+    ax.set_xlabel('Trial', fontsize=20)
+    ax.set_ylabel('Validation loss (Macro F1 Score)', fontsize=20)
+    ax.set_title('Optimization history', fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(prop={'size': 14})
+    plt.tight_layout()
+    plt.savefig(PLOTS_PATH+'optimization_history.png')
+    
+    ax = plot_param_importances(study)
+    ax.set_xlabel('Importance for validation loss', fontsize=20                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               )
+    ax.set_ylabel('Hyperparameter', fontsize=20)
+    ax.set_title('Hyperparameter Importances', fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(prop={'size': 14})
+    plt.tight_layout()
+    plt.savefig(PLOTS_PATH+'parameter_importances.png')
+    
+    ax = plot_contour(study, params=['learning_rate', 'max_depth'], target_name='Validation loss')
+    ax.set_xlabel('Learning rate', fontsize=20)
+    ax.set_ylabel('Max depth', fontsize=20)
+    ax.set_title('Contour plot', fontsize=24)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    ax.legend(prop={'size': 20})
+    plt.tight_layout()
+    plt.savefig(PLOTS_PATH+'contour.png')
+    
+    cb = callback.EarlyStopping(rounds=10,
+            min_delta=1e-4,
+            save_best=True,
+            maximize=False,
+            data_name="validation_1",
+            metric_name="mlogloss")
+    
+    # Train the best model on the full training set
+    best_params = study.best_params
+    best_model = XGBClassifier(
+        objective='multi:softprob',
+        eval_metric='mlogloss',
+        num_class=len(set(y_train)),
+        random_state=RANDOM_STATE,
+        callbacks=[cb],
+        **best_params
     )
-    grid_search.fit(X_train, y_train)
     
-    print("Best XGBoost parameters found: ", grid_search.best_params_)
-    
-    return grid_search.best_estimator_
+    model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
+    eval_results = model.evals_result()
+    plot_eval_metrics(eval_results, 'eval_scores')
+    return best_model
 
 def plot_histogram(series, xlabel, ylabel, title, name):
     plt.figure(figsize=(12, 10))
@@ -1169,7 +1436,7 @@ def plot_full_and_zoomed_displacement(df, name, idx, zoom_window=10):
         fig.suptitle(f'Zoomed View for Station: {station_name} around {date.date()}', fontsize=16)
 
         for i, component in enumerate(['N', 'E', 'U']):
-            axs[i].plot(zoom_df.index, zoom_df[component], color='blue', label=f"{component} Displacement")
+            axs[i].plot(zoom_df.index, zoom_df[component], color='gray', label=f"{component} Displacement")
             for label_date in zoom_df[zoom_df['labels_sum'] > 0].index:
                 axs[i].axvline(label_date, color='blue', linestyle='-', label="Actual Earthquake Label" if i == 0 else "")
             
@@ -1421,7 +1688,62 @@ def evaluation(test_predictions, test_labels, cleaned_dfs, stations, start_indic
         
     return original_test_predictions
 
-def train_model(X, y, start_index, stations, model_type, cleaned_dfs):
+
+def extract_unique_geometries(geometries):
+    """
+    Extract unique geometries from a list of Point geometries.
+    
+    Parameters:
+    geometries (list): List of geometry Points.
+    
+    Returns:
+    GeoSeries: A GeoSeries of unique geometries.
+    """
+    return gpd.GeoSeries(list(set(geometries)), crs="EPSG:4326")
+
+def plot_station_geometries(geometries, geometries_sim):
+    """
+    Plots station locations with different colors for train, eval, test, and simulated stations on a basemap.
+
+    Parameters:
+    geometries (tuple): A tuple of lists containing geometries for (train, eval, test) stations.
+    geometries_sim (list): A list containing geometries for simulated stations.
+    """
+    # Unpack train, eval, and test station geometries and remove duplicates
+    train_stations = extract_unique_geometries(geometries[0])
+    eval_stations = extract_unique_geometries(geometries[1])
+    test_stations = extract_unique_geometries(geometries[2])
+    sim_stations = extract_unique_geometries(geometries_sim)
+
+    gdf = gpd.GeoDataFrame({
+        'geometry': pd.concat([train_stations, eval_stations, test_stations, sim_stations]),
+        'type': (['Train'] * len(train_stations) +
+                 ['Eval'] * len(eval_stations) +
+                 ['Test'] * len(test_stations) +
+                 ['Simulated'] * len(sim_stations))
+    }, crs="EPSG:4326")
+
+    # Transform coordinates to match the basemap's CRS (Web Mercator)
+    gdf.to_crs(epsg=3857, inplace=True)
+
+    fig, ax = plt.subplots(figsize=(12, 12))
+    for station_type, color, marker in zip(['Train', 'Eval', 'Test', 'Simulated'],
+                                           ['blue', 'green', 'red', 'orange'],
+                                           ['o', 's', '^', 'x']):
+        gdf[gdf['type'] == station_type].plot(
+            ax=ax, color=color, marker=marker, markersize=50, label=f'{station_type} Stations', alpha=0.7
+        )
+    ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik)
+
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Station Locations by Usage Type")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_stations.png')
+    plt.close()
+
+def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries):
     """
     Trains a model based on the specified type using both North, East, and Up component data.
 
@@ -1435,14 +1757,14 @@ def train_model(X, y, start_index, stations, model_type, cleaned_dfs):
     report: Classification report for the test set.
     """
     
-    X_train, X_eval, X_test, y_train, y_eval, y_test, weights, test_start_index, test_stations = prepare_data(X, y, start_index, stations)
+    X_train, X_eval, X_test, y_train, y_eval, y_test, weights, test_start_index, test_stations, geometries = prepare_data(X, y, start_index, stations, geometries)
 
     if model_type == 'IsolationForest':
         model = optimize_isolation_forest(X_train, y_train)
         test_predictions = model.predict(X_test)
         
     elif model_type == 'RandomForest':
-        model = optimize_random_forest(X_train, y_train, weights)
+        model = optimize_random_forest(X_train, y_train, X_eval, y_eval, weights)
         test_predictions = model.predict(X_test)
     
     elif model_type == 'HistGradientBoosting':
@@ -1466,7 +1788,7 @@ def train_model(X, y, start_index, stations, model_type, cleaned_dfs):
     save_csv(test_stations, STATION_NAMES)
     for window in [None, 1]:
         test_predictions = evaluation(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window, cleaned_dfs=cleaned_dfs, stations=test_stations, start_indices=test_start_index)
-    return model
+    return model, geometries
 
 
 def main():
@@ -1494,7 +1816,7 @@ def main():
         if file_path.is_file():
             dfs.append(read_file(file_path.name))
 
-    cleaned_dfs, simulated_dfs = clean_dataframes(dfs, missing_value_threshold=0, limited_period=True, minimal_offset=10)
+    cleaned_dfs, simulated_dfs = clean_dataframes(dfs, missing_value_threshold=5, limited_period=True, minimal_offset=5)
     
     df_dict = {f'df_{i}': df for i, df in enumerate(cleaned_dfs)}
     pd.to_pickle(df_dict, CLEANED_DATA_PATH)
@@ -1502,14 +1824,17 @@ def main():
     
     # HistGradientBoosting designed to deal with None data -> No interpolation needed
     interpolate = False if MODEL_TYPE == 'HistGradientBoosting' else True
-    X, y, start_index, stations = extract_features(cleaned_dfs, interpolate=interpolate)
+    X, y, start_index, stations, geometries = extract_features(cleaned_dfs, interpolate=interpolate)
     
     X.to_csv(f'{FEATURES_PATH}_features.csv', index=True)
     pd.Series(y).to_csv(f'{FEATURES_PATH}_target.csv', index=False, header=False)
     
-    model = train_model(X, y, start_index, stations, model_type=MODEL_TYPE, cleaned_dfs=cleaned_dfs)
+    model, geometries = train_model(X, y, start_index, stations, model_type=MODEL_TYPE, cleaned_dfs=cleaned_dfs, geometries=geometries)
     
-    X_test, y_test, start_index_test, stations_test = extract_features(simulated_dfs, interpolate=interpolate)
+    X_test, y_test, start_index_test, stations_test, geometries_sim = extract_features(simulated_dfs, interpolate=interpolate)
+    
+    # Not possible on cluster due to network restrictions
+    #plot_station_geometries(geometries, geometries_sim)
     
     test_predictions = model.predict(X_test)
     test_predictions = pd.Series(test_predictions, index=start_index_test)
