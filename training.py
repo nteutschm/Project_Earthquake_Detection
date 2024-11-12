@@ -31,9 +31,9 @@ pd.options.mode.chained_assignment = None
 
 
 DATA_PATH = '/cluster/home/nteutschm/eqdetection/data/'
-RANDOM_STATE = 61
+RANDOM_STATE = 81
 # Available: IsolationForest HistGradientBoosting RandomForest XGBoost
-MODEL_TYPE = 'RandomForest'
+MODEL_TYPE = 'XGBoost'
 
 MODEL_PATH = f'/cluster/scratch/nteutschm/eqdetection/models/{MODEL_TYPE}.pkl'
 PREDICTIONS_PATH = f'/cluster/scratch/nteutschm/eqdetection/predictions/{MODEL_TYPE}.csv'
@@ -51,9 +51,9 @@ LOAD_MODEL = False # If already trained model is saved under MODEL_PATH, it can 
 
 #columns to include in creating the chunks, (offset and decay not really necessary, as crucial information already present in labels)
 #available: ['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU', 'latitude', 'cos_longitude', 'sin_longitude', 'height', 'offset_value', 'offset_error', 'decay_value', 'decay_error', 'decay_tau', 'decay_type']
-USED_COLS = ['N', 'E', 'U', 'N sig', 'E sig', 'U sig', 'CorrNE', 'CorrNU', 'CorrEU', 'latitude', 'cos_longitude', 'sin_longitude', 'height']
+USED_COLS = ['N', 'E', 'U', 'latitude', 'cos_longitude', 'sin_longitude']
 
-OPTIMAL_PARAMS = False # If optimal parametrs should be used to train the model, or the parameters should be tuned (set to False)
+OPTIMAL_PARAMS = True # If optimal parametrs should be used to train the model, or the parameters should be tuned (set to False)
 
 # How much percentage (expressed between 0 and 1) of the majority class the minority classes should be (lower end, upper end)
 OVERSAMPLING_PERCENTAGES = (0.3, 0.5)
@@ -66,48 +66,43 @@ CHUNK_SIZE = 21
 
 # If OPTIMAL_PARAMS is True, these parameters are used for the training process:
 BEST_PARAMS_RANDOM_FOREST = {
-    'n_estimators': 100,
-    'max_depth': 30,
-    'class_weight': {0: 0.04991626849390834, 1: 20.055555555555557, 2: 19.0, 3: 20.180124223602483, 4: 20.433962264150942, 5: 19.8109756097561, 6: 20.694267515923567, 7: 19.8109756097561, 8: 19.69090909090909, 9: 21.66, 10: 20.30625, 11: 20.826923076923077, 12: 22.253424657534246, 13: 21.375, 14: 20.826923076923077, 15: 20.055555555555557, 16: 22.5625, 17: 22.253424657534246, 18: 21.66, 19: 21.66, 20: 19.69090909090909},
-    'random_state': RANDOM_STATE
+    'n_estimators': 300,
+    'max_depth': 15,
+    'min_samples_split': 10,
+    'min_samples_leaf': 5,
+    'max_features': 'sqrt',
+    'bootstrap': True,
+    'max_samples': 0.8
 }
 
 BEST_PARAMS_ISOLATION_FOREST = {
     'n_estimators': 300,
     'max_samples': 0.8,
-    'contamination': 0.001,
-    'random_state': RANDOM_STATE
+    'contamination': 0.001
 }
 
 BEST_PARAMS_HIST_GRADIENT_BOOSTING = {
     'learning_rate': 0.2,
     'max_iter': 300,
     'max_depth': 15,
-    'class_weight': {0: 0.5255337831592569, 1: 10.290950226244345},
-    'random_state': RANDOM_STATE,
     'early_stopping': True,
     'n_iter_no_change': 7,
     'validation_fraction': 0.1
 }
 
+BEST_PARAMS_XGBOOST = {'n_estimators': 262, 
+                       'max_depth': 23, 
+                       'learning_rate': 0.028080076902022896, 
+                       'subsample': 0.887455634212151, 
+                       'colsample_bytree': 0.5404440391799717, 
+                       'gamma': 7.819897209633202, 
+                       'min_child_weight': 1, 
+                       'max_delta_step': 6, 
+                       'reg_alpha': 0.5938051232258645, 
+                       'reg_lambda': 1.4497126942471206,
+                       'objective':'multi:softprob',
+                       'eval_metric':'mlogloss'}
 
-BEST_PARAMS_XGBOOST = {
-    'n_estimators': 493, 
-    'max_depth': 20, 
-    'learning_rate': 0.13353757064419783, 
-    'subsample': 0.8734517481859924, 
-    'colsample_bytree': 0.7266943177706023, 
-    'gamma': 0.0008884960416922771, 
-    'min_child_weight': 1, 
-    'max_delta_step': 2, 
-    'random_state': RANDOM_STATE,
-    'objective': 'multi:softprob',
-    'eval_metric': 'mlogloss'}
-
-BEST_PARAMS_XGBOOST = {'n_estimators': 204, 'max_depth': 7, 'learning_rate': 0.03297805658471294, 
-                       'subsample': 0.64782202714359, 'colsample_bytree': 0.614915400500874, 
-                       'gamma': 2.4165973400576046, 'min_child_weight': 7, 'max_delta_step': 7,
-                       'random_state': RANDOM_STATE, 'objective': 'multi:softprob', 'eval_metric': 'mlogloss'}
 
 def get_offsets(header_lines):
     """
@@ -379,6 +374,7 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
     station_names = []
     components_offsets = ['n', 'e', 'u'] 
     geometries = []
+    non_chunked_columns = ['latitude', 'cos_longitude', 'sin_longitude', 'height']
     
     cols = USED_COLS
     for df in dfs:
@@ -426,7 +422,15 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
         # Create the feature matrix with chunking -> chunks are only created for the columns that were specified earlier in the cols variable
         for i in range(len(features) - chunk_size + 1):
             # Create a chunk of size `chunk_size` for each feature
-            feature_row = np.hstack([features[col].values[i:i + chunk_size] for col in cols])
+            feature_row = []
+
+            for col in cols:
+                if col in non_chunked_columns:
+                    # Add the value of the column directly without chunking
+                    feature_row.append(features[col].values[i])  # Just take the value at position i
+                else:
+                    # For columns that should be chunked, take the chunk
+                    feature_row.extend(features[col].values[i:i + chunk_size])
             feature_matrix.append(feature_row)
             
             time_index.append(features.index[i])
@@ -450,7 +454,7 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
 
     return pd.DataFrame(np.array(feature_matrix)), target_vector, time_index, station_names, geometries
 
-def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclusion_range=(-10, 10), decay_rate_range=(0.01, 0.1), noise_level=0.5, random_state=RANDOM_STATE):
+def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-1, 1), exclusion_range=(-0.5, 0.5), random_state=RANDOM_STATE):
     """
     Generates synthetic test data by adding random offsets with random decay and noise to selected dataframes.
     
@@ -490,16 +494,11 @@ def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclu
         outlier_component = rng.choice(components)
         
         synthetic_offsets = {}
-        decay_info = {}
         for comp in components:
             if comp == outlier_component:
                 synthetic_offsets[comp] = generate_outside_exclusion()
             else:
                 synthetic_offsets[comp] = generate_within_exclusion()
-            decay_info[comp] = {
-                'type': rng.choice(['exponential', 'logarithmic']),
-                'rate': rng.uniform(*decay_rate_range)
-            }
         
         # Apply offsets to the displacement columns starting from the random date
         for comp, cm in zip(components, comps):
@@ -507,22 +506,7 @@ def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclu
             start_date = random_date - pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
             end_date = random_date + pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1]))
             df = df[(df.index >= start_date) & (df.index <= end_date)]
-            decay_type = decay_info[comp]['type']
-            decay_rate = decay_info[comp]['rate']
-            
-            time_span = (df.index >= random_date) & (df.index <= min(random_date + pd.Timedelta(days=rng.integers(NBR_OF_DAYS[0], NBR_OF_DAYS[1])), df.index[-1]))
-            decay_period = np.arange(sum(time_span))
-            
-            if decay_type == 'exponential':
-                decayed_values = offset_value * np.exp(-decay_rate * decay_period)
-            elif decay_type == 'logarithmic':
-                decayed_values = offset_value / (1 + decay_rate * decay_period)
-            
-            # Add Gaussian noise
-            noise = rng.normal(0, noise_level, size=len(decayed_values))
-            decayed_values += noise
-            
-            df.loc[time_span, cm] += decayed_values
+            df.loc[random_date:, cm] += offset_value
             
             if 'offsets' not in df.attrs:
                 df.attrs['offsets'] = {c: {'offsets': [], 'ps_decays': []} for c in components}
@@ -530,17 +514,10 @@ def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-40, 40), exclu
             df.attrs['offsets'][comp]['offsets'].append({
                 'date': random_date,
                 'value': offset_value,
-                'error': noise_level,
+                'error': 0.0,
                 'coseismic': True
             })
-            
-            df.attrs['offsets'][comp]['ps_decays'].append({
-                'date': random_date,
-                'value': 0,
-                'error': noise_level,
-                'tau': decay_rate,
-                'type': decay_type
-            })
+            df.attrs['offsets'][comp]['ps_decays'] = [{'date': random_date, 'value': 0, 'error': 0, 'tau': 0, 'type': ''}]
         
         df.name = name
         synthetic_dfs.append(df)
@@ -579,7 +556,7 @@ def compute_weights(train_labels):
     class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=train_labels)
     return {c: w for c, w in zip(classes, class_weights)}
 
-def prepare_data(X, y, start_index, stations, geometries, random_state=RANDOM_STATE):
+def prepare_data(X, y, start_index, stations, geometries):
     """
     Prepares training, evaluation, and testing data by splitting based on stations,
     so that no station appears in more than one set.
@@ -595,11 +572,11 @@ def prepare_data(X, y, start_index, stations, geometries, random_state=RANDOM_ST
     Returns:
     X_train, X_eval, X_test, y_train, y_eval, y_test, class_weights, test_start_index, test_stations
     """
-    unique_stations = list(set(stations))
-    np.random.seed(random_state)
-    np.random.shuffle(unique_stations)
+    unique_stations = sorted(list(set(stations)))
+    rng = np.random.default_rng(seed=RANDOM_STATE) 
+    unique_stations = rng.permutation(unique_stations) 
     n_train = int(0.7 * len(unique_stations))
-    n_eval = int(0.1 * len(unique_stations))
+    n_eval = int(0.15 * len(unique_stations))
     
     train_stations = unique_stations[:n_train]
     eval_stations = unique_stations[n_train:n_train + n_eval]
@@ -629,19 +606,45 @@ def prepare_data(X, y, start_index, stations, geometries, random_state=RANDOM_ST
         [start_index[i] for i in range(len(start_index)) if test_mask[i]],
         [geometries[i] for i in range(len(geometries)) if test_mask[i]]
     )
+    
+    def scale_features_per_station(X, station_list):
+        unique_stations = set(station_list)
+        scaled_data = pd.DataFrame(index=X.index, columns=X.columns)
 
-    # Get stations for each test sample (not unique)
+        if 'latitude' in USED_COLS:
+            geo_columns = X.columns[-3:]
+        else:
+            geo_columns = []
+
+        if not isinstance(geo_columns, list):
+            scaler = MinMaxScaler()
+            X[geo_columns] = scaler.fit_transform(X[geo_columns])
+
+        for station in unique_stations:
+            station_indices = [i for i, s in enumerate(station_list) if s == station]
+            X_station = X.iloc[station_indices]
+
+            columns_to_scale = [col for col in X_station.columns if col not in geo_columns]
+
+            if columns_to_scale:
+                scaler = MinMaxScaler()
+                X_station_scaled = X_station[columns_to_scale]
+                X_station_scaled = scaler.fit_transform(X_station_scaled)
+                X_station[columns_to_scale] = X_station_scaled
+
+            scaled_data.iloc[station_indices] = X_station
+
+        return scaled_data.astype(np.float32)
+    
+    train_stations = [stations[i] for i in range(len(stations)) if train_mask[i]]
+    eval_stations = [stations[i] for i in range(len(stations)) if eval_mask[i]]
     test_stations = [stations[i] for i in range(len(stations)) if test_mask[i]]
 
-    # Scale the features
-    scaler = MinMaxScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_eval = scaler.transform(X_eval)
-    X_test = scaler.transform(X_test)
+    X_train = scale_features_per_station(X_train, train_stations)
+    X_eval = scale_features_per_station(X_eval, eval_stations)
+    X_test = scale_features_per_station(X_test, test_stations)
     
     # Oversample the minority classes to a random percentage between 10% and 40% of the majority class
-    rng = np.random.default_rng(seed=RANDOM_STATE)
-    
     class_counts = Counter(y_train)
     majority_class = max(class_counts, key=class_counts.get)
 
@@ -652,13 +655,13 @@ def prepare_data(X, y, start_index, stations, geometries, random_state=RANDOM_ST
             target_count = int(class_counts[majority_class] * random_percentage)
             sampling_strategy[cls] = target_count
     
-    smote = SMOTE(sampling_strategy=sampling_strategy, random_state=random_state)
+    smote = SMOTE(sampling_strategy=sampling_strategy, random_state=RANDOM_STATE)
     X_train, y_train = smote.fit_resample(X_train, y_train)
 
     # Compute class weights to handle imbalanced dataset
     class_weights = compute_weights(y_train)
     
-    return X_train, X_eval, X_test, y_train, y_eval, y_test, class_weights, test_start_index, test_stations, (geometries_train, geometries_eval, geometries_test)
+    return pd.DataFrame(X_train), pd.DataFrame(X_eval), pd.DataFrame(X_test), pd.Series(y_train), pd.Series(y_eval), pd.Series(y_test), class_weights, test_start_index, test_stations, (geometries_train, geometries_eval, geometries_test)
 
 def print_callback(study, trial):
     '''Print some useful information regarding the hyperparameter optimization'''
@@ -700,7 +703,9 @@ def random_forest(weights):
         min_samples_split=BEST_PARAMS_RANDOM_FOREST['min_samples_split'],
         min_samples_leaf=BEST_PARAMS_RANDOM_FOREST['min_samples_leaf'],
         class_weight=weights,
-        random_state=RANDOM_STATE
+        random_state=RANDOM_STATE,
+        bootstrap=BEST_PARAMS_RANDOM_FOREST['bootstrap'],
+        max_samples=BEST_PARAMS_RANDOM_FOREST['max_samples']
     )
     return model
 
@@ -719,7 +724,7 @@ def isolation_forest():
         n_estimators=BEST_PARAMS_ISOLATION_FOREST['n_estimators'],
         max_samples=BEST_PARAMS_ISOLATION_FOREST['max_samples'],
         contamination=BEST_PARAMS_ISOLATION_FOREST['contamination'],
-        random_state=BEST_PARAMS_ISOLATION_FOREST['random_state']
+        random_state=RANDOM_STATE
     )
     return model
 
@@ -738,8 +743,8 @@ def hist_gradient_boosting(weights):
         learning_rate=BEST_PARAMS_HIST_GRADIENT_BOOSTING['learning_rate'],
         max_iter=BEST_PARAMS_HIST_GRADIENT_BOOSTING['max_iter'],
         max_depth=BEST_PARAMS_HIST_GRADIENT_BOOSTING['max_depth'],
-        class_weight=weights, #BEST_PARAMS_HIST_GRADIENT_BOOSTING['sample_weight'],
-        random_state=BEST_PARAMS_HIST_GRADIENT_BOOSTING['random_state'],
+        class_weight=weights,
+        random_state=RANDOM_STATE,
         early_stopping=BEST_PARAMS_HIST_GRADIENT_BOOSTING['early_stopping'],
         n_iter_no_change=BEST_PARAMS_HIST_GRADIENT_BOOSTING['n_iter_no_change'],
         validation_fraction=BEST_PARAMS_HIST_GRADIENT_BOOSTING['validation_fraction']
@@ -757,7 +762,7 @@ def xgboost(y_train):
     Returns:
     XGBClassifier: An XGBoost model with optimal settings.
     """
-    cb = callback.EarlyStopping(rounds=10,
+    cb = callback.EarlyStopping(rounds=5,
             min_delta=1e-4,
             save_best=True,
             maximize=False,
@@ -772,11 +777,13 @@ def xgboost(y_train):
         gamma=BEST_PARAMS_XGBOOST['gamma'],
         min_child_weight=BEST_PARAMS_XGBOOST['min_child_weight'],
         max_delta_step=BEST_PARAMS_XGBOOST['max_delta_step'],
-        random_state=BEST_PARAMS_XGBOOST['random_state'],
+        random_state=RANDOM_STATE,
         objective=BEST_PARAMS_XGBOOST['objective'],
         eval_metric=BEST_PARAMS_XGBOOST['eval_metric'],
         num_class=len(set(y_train)), 
-        callbacks=[cb]
+        callbacks=[cb], 
+        reg_alpha=BEST_PARAMS_XGBOOST['reg_alpha'],
+        reg_lambda=BEST_PARAMS_XGBOOST['reg_lambda']
     )
     return model
 
@@ -807,16 +814,15 @@ def optimize_random_forest(X_train, y_train, X_eval, y_eval, weights):
         return model
     
     def objective(trial):
-        # Suggest values for the hyperparameters
-        n_estimators = trial.suggest_int('n_estimators', 100, 500)  # Number of trees in the forest
-        max_depth = trial.suggest_int('max_depth', 5, 30)  # Depth of the trees
-        min_samples_split = trial.suggest_int('min_samples_split', 2, 20)  # Min samples required to split
-        min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 10)  # Min samples at each leaf node
-        max_features = trial.suggest_categorical('max_features', ['sqrt', 'log2'])  # Number of features to consider at each split
-        bootstrap = trial.suggest_categorical('bootstrap', [True, False])  # Whether to use bootstrapped samples
-        criterion = trial.suggest_categorical('criterion', ['gini', 'entropy'])  # Splitting criterion
+        n_estimators = trial.suggest_int('n_estimators', 100, 600)
+        max_depth = trial.suggest_int('max_depth', 5, 35)
+        min_samples_split = trial.suggest_int('min_samples_split', 2, 25)
+        min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 15)
+        max_features = trial.suggest_categorical('max_features', ['sqrt', 'log2', None])
+        bootstrap = trial.suggest_categorical('bootstrap', [True, False])
+        max_samples = trial.suggest_float('max_samples', 0.5, 1.0) if bootstrap else None
+        criterion = trial.suggest_categorical('criterion', ['gini', 'entropy'])
 
-        # Initialize RandomForestClassifier with suggested hyperparameters
         model = RandomForestClassifier(
             n_estimators=n_estimators,
             max_depth=max_depth,
@@ -827,12 +833,13 @@ def optimize_random_forest(X_train, y_train, X_eval, y_eval, weights):
             criterion=criterion,
             random_state=RANDOM_STATE,
             class_weight=weights,
+            max_samples=max_samples,
             n_jobs=-1
         )
         
         model.fit(X_train, y_train)
         y_pred = model.predict(X_eval)
-        f1_macro = f1_score(y_eval, y_pred, average='macro')  # Use macro F1 score for balanced evaluation
+        f1_macro = f1_score(y_eval, y_pred, average='macro')
         return f1_macro
     
     # Create an Optuna study and optimize
@@ -1007,22 +1014,22 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
     if OPTIMAL_PARAMS:
         print(f'Training XGBoost model using the specified optimal parameters: {BEST_PARAMS_XGBOOST}')
         model = xgboost(y_train)
-        X_combined = pd.concat([X_train, X_eval])
-        y_combined = pd.concat([y_train, y_eval])
-        model.fit(X_combined, y_combined, verbose=True)
+        model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
+        eval_results = model.evals_result()
+        plot_eval_metrics(eval_results, 'eval_scores')
         return model
     
-    # Define the Optuna objective function
     def objective(trial):
-        # Suggest values for the hyperparameters
-        n_estimators = trial.suggest_int('n_estimators', 100, 500)
+        n_estimators = trial.suggest_int('n_estimators', 100, 800)
         max_depth = trial.suggest_int('max_depth', 5, 30)
-        learning_rate = trial.suggest_float('learning_rate', 0.01, 0.2, log=True)
-        subsample = trial.suggest_float('subsample', 0.6, 1.0)
-        colsample_bytree = trial.suggest_float('colsample_bytree', 0.6, 1.0)
-        gamma = trial.suggest_float('gamma', 0, 5)
-        min_child_weight = trial.suggest_int('min_child_weight', 1, 10)
+        learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
+        subsample = trial.suggest_float('subsample', 0.5, 1.0)
+        colsample_bytree = trial.suggest_float('colsample_bytree', 0.5, 1.0)
+        gamma = trial.suggest_float('gamma', 0, 10)
+        min_child_weight = trial.suggest_int('min_child_weight', 1, 15)
         max_delta_step = trial.suggest_int('max_delta_step', 0, 10)
+        reg_alpha = trial.suggest_float('reg_alpha', 0.0, 1.0)
+        reg_lambda = trial.suggest_float('reg_lambda', 0.5, 3.0)
         
         cb = callback.EarlyStopping(rounds=10,
             min_delta=1e-4,
@@ -1033,7 +1040,6 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
         
         pruning = optuna.integration.XGBoostPruningCallback(trial, "validation_0-mlogloss")
         
-        # Initialize XGBClassifier with suggested hyperparameters
         xgb = XGBClassifier(
             objective='multi:softprob',
             eval_metric='mlogloss',
@@ -1047,7 +1053,9 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
             min_child_weight=min_child_weight,
             max_delta_step=max_delta_step,
             callbacks=[pruning, cb],
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            reg_alpha=reg_alpha,
+            reg_lambda=reg_lambda
         )
         
         xgb.fit(X_train, y_train,
@@ -1112,8 +1120,8 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
         **best_params
     )
     
-    model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
-    eval_results = model.evals_result()
+    best_model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
+    eval_results = best_model.evals_result()
     plot_eval_metrics(eval_results, 'eval_scores')
     return best_model
 
@@ -1156,7 +1164,7 @@ def plot_cumulative_metrics(cumulative_metrics_df, name):
     plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative Recall'], label='Cumulative Recall', color='green')
     plt.plot(cumulative_metrics_df['Date'], cumulative_metrics_df['Smoothed Cumulative F1'], label='Cumulative F1 Score', color='purple')
 
-    plt.title('Cumulative Metrics Over Time (Smoothed over 90 days)')
+    plt.title('Cumulative Metrics Over Time (Smoothed over 180 days)')
     plt.xlabel('Date')
     plt.ylabel('Metric Value')
 
@@ -1323,7 +1331,7 @@ def dechunk_labels_predictions(dfs, chunk_size=CHUNK_SIZE):
     for df in dfs:
         df.index = pd.to_datetime(df.index)
         start_date = df.index.min()
-        end_date = df.index.max() + pd.Timedelta(days=chunk_size - 1)
+        end_date = df.index.max() + pd.Timedelta(days=chunk_size)
         continuous_index = pd.date_range(start=start_date, end=end_date)
 
         time_series_df = pd.DataFrame(index=continuous_index, columns=['labels_sum', 'preds_sum'], dtype='int64')
@@ -1453,7 +1461,7 @@ def plot_full_and_zoomed_displacement(df, name, idx, zoom_window=10):
         plt.savefig(f'{PLOTS_PATH}_{name}_zoom_{idx}.png')
         plt.close()
 
-def calculate_prediction_statistics(dfs, chunk_size=CHUNK_SIZE):
+def calculate_prediction_statistics(dfs, name, chunk_size=CHUNK_SIZE):
     """
     Calculates and prints statistics on prediction accuracy.
     
@@ -1503,6 +1511,20 @@ def calculate_prediction_statistics(dfs, chunk_size=CHUNK_SIZE):
     print(f"  Percentage: {undetected_percentage:.2f}% of total earthquakes")
 
     print("\n==================================\n")
+    
+    labels = ['Exact Matches', f'Predicted within {chunk_size} Days', 'Undetected']
+    values = [predicted_exact_percentage, predicted_within_percentage, undetected_percentage]
+    colors = ['#66c2a5', '#fc8d62', '#8da0cb']
+    plt.figure(figsize=(8, 6))
+    plt.bar(labels, values, color=colors, edgecolor='black')
+    plt.ylabel('Percentage')
+    plt.title("Prediction Accuracy Breakdown")
+    plt.ylim(0, 100)
+    for i, v in enumerate(values):
+        plt.text(i, v + 2, f"{v:.1f}%", ha='center', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png')
+    plt.close()
     
 def calculate_mean_metrics(time_series_data):
     all_labels = []
@@ -1645,7 +1667,7 @@ def evaluation(test_predictions, test_labels, cleaned_dfs, stations, start_indic
     cumulative_metrics_df['Cumulative Recall'] = cumulative_recalls
     cumulative_metrics_df['Cumulative F1 Score'] = cumulative_f1_scores
 
-    window_size = 90
+    window_size = 180
     cumulative_metrics_df['Smoothed Cumulative Accuracy'] = cumulative_metrics_df['Cumulative Accuracy'].rolling(window=window_size, min_periods=1).mean()
     cumulative_metrics_df['Smoothed Cumulative Precision'] = cumulative_metrics_df['Cumulative Precision'].rolling(window=window_size, min_periods=1).mean()
     cumulative_metrics_df['Smoothed Cumulative Recall'] = cumulative_metrics_df['Cumulative Recall'].rolling(window=window_size, min_periods=1).mean()
@@ -1670,7 +1692,7 @@ def evaluation(test_predictions, test_labels, cleaned_dfs, stations, start_indic
         averaged_importances = np.mean(feature_importances.reshape(-1, num_features), axis=0)
         print(f"Averaged Feature Importances for used columns {USED_COLS}: \n{averaged_importances}")
         
-    time_series = pd.concat([pd.Series(stations, index=start_indices, name='stations'), pd.Series(test_labels, index=start_indices, name='labels'), pd.Series(test_predictions, index=start_indices, name='preds')], axis=1)
+    time_series = pd.concat([pd.Series(stations.values, index=start_indices, name='stations'), pd.Series(test_labels, index=start_indices, name='labels'), pd.Series(test_predictions, index=start_indices, name='preds')], axis=1)
     time_series = [group for _, group in time_series.groupby('stations')]
     for i, df in enumerate(time_series):
         df.attrs['station'] = df['stations'].iloc[0]
@@ -1679,7 +1701,7 @@ def evaluation(test_predictions, test_labels, cleaned_dfs, stations, start_indic
     dfs = dechunk_labels_predictions(time_series)
     print('Forming mean predictions over all chunks')
     total_df = combined_df(cleaned_dfs, dfs)
-    calculate_prediction_statistics(total_df)
+    calculate_prediction_statistics(total_df, f'mean_preds_stats{tolerance_str}')
     calculate_mean_metrics(total_df)
     rng = np.random.default_rng(seed=RANDOM_STATE)
     for idx in range(10):
@@ -1779,7 +1801,7 @@ def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries
         raise ValueError('Used Model Type not implemented. Please control spelling!')
     
     test_predictions = pd.Series(test_predictions, index=test_start_index)
-    test_labels = pd.Series(y_test, index=test_start_index)
+    test_labels = pd.Series(y_test.values, index=test_start_index)
     test_stations = pd.Series(test_stations, index=test_start_index)
     
     joblib.dump(model, MODEL_PATH)
@@ -1816,7 +1838,7 @@ def main():
         if file_path.is_file():
             dfs.append(read_file(file_path.name))
 
-    cleaned_dfs, simulated_dfs = clean_dataframes(dfs, missing_value_threshold=5, limited_period=True, minimal_offset=5)
+    cleaned_dfs, simulated_dfs = clean_dataframes(dfs, missing_value_threshold=0, limited_period=True, minimal_offset=10)
     
     df_dict = {f'df_{i}': df for i, df in enumerate(cleaned_dfs)}
     pd.to_pickle(df_dict, CLEANED_DATA_PATH)
@@ -1834,7 +1856,7 @@ def main():
     X_test, y_test, start_index_test, stations_test, geometries_sim = extract_features(simulated_dfs, interpolate=interpolate)
     
     # Not possible on cluster due to network restrictions
-    #plot_station_geometries(geometries, geometries_sim)
+    # plot_station_geometries(geometries, geometries_sim)
     
     test_predictions = model.predict(X_test)
     test_predictions = pd.Series(test_predictions, index=start_index_test)
