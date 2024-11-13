@@ -361,7 +361,7 @@ def extract_features(dfs, interpolate=True, chunk_size=CHUNK_SIZE):
 
     return pd.DataFrame(np.array(feature_matrix)), target_vector, time_index, station_names, geometries
 
-def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-1, 1), exclusion_range=(-0.5, 0.5), random_state=RANDOM_STATE):
+def generate_synthetic_offsets(dfs, num_series=50, offset_range=(-1.5, 1.5), exclusion_range=(-0.5, 0.5), random_state=RANDOM_STATE):
     """
     Generates synthetic test data by adding random offsets with random decay and noise to selected dataframes.
     

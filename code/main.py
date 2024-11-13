@@ -227,8 +227,10 @@ def main():
     test_predictions = pd.Series(test_predictions, index=start_index_test)
     y_test = pd.Series(y_test, index=start_index_test)
     stations_test = pd.Series(stations_test, index=start_index_test)
-    for window in [None, 1]:
-        test_predictions = evaluate(test_predictions, y_test, model=model, X_test=X_test, tolerance_window=window, cleaned_dfs=simulated_dfs, stations=stations_test, start_indices=start_index_test, simulated=True)
+    
+    # For now excluded due to the bad accurcay of the simulations
+    #for window in [None, 1]:
+    #    test_predictions = evaluate(test_predictions, y_test, model=model, X_test=X_test, tolerance_window=window, cleaned_dfs=simulated_dfs, stations=stations_test, start_indices=start_index_test, simulated=True)
     
     sys.stdout = sys.__stdout__
     log.close()

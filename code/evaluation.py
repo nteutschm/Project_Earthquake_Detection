@@ -296,44 +296,6 @@ def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices
 
     plot_heatmap(np.log1p(heatmap_data), mask, f'heatmap{tolerance_str}')
     
-    cumulative_metrics_df = pd.DataFrame({
-    'Date': time_index, 
-    'Labels': test_labels,
-    'Predictions': test_predictions
-})
-
-    cumulative_metrics_df['Cumulative Correct'] = (cumulative_metrics_df['Labels'] == cumulative_metrics_df['Predictions']).cumsum()
-    cumulative_metrics_df['Cumulative Accuracy'] = cumulative_metrics_df['Cumulative Correct'] / np.arange(1, len(cumulative_metrics_df) + 1)
-
-    cumulative_precisions = []
-    cumulative_recalls = []
-    cumulative_f1_scores = []
-
-    for i in range(1, len(cumulative_metrics_df) + 1):
-        current_labels = cumulative_metrics_df['Labels'][:i]
-        current_predictions = cumulative_metrics_df['Predictions'][:i]
-
-        precision, recall, f1, _ = precision_recall_fscore_support(current_labels, current_predictions, average='macro', zero_division=0)
-
-        cumulative_precisions.append(precision)
-        cumulative_recalls.append(recall)
-        cumulative_f1_scores.append(f1)
-
-    cumulative_metrics_df['Cumulative Precision'] = cumulative_precisions
-    cumulative_metrics_df['Cumulative Recall'] = cumulative_recalls
-    cumulative_metrics_df['Cumulative F1 Score'] = cumulative_f1_scores
-
-    window_size = 180
-    cumulative_metrics_df['Smoothed Cumulative Accuracy'] = cumulative_metrics_df['Cumulative Accuracy'].rolling(window=window_size, min_periods=1).mean()
-    cumulative_metrics_df['Smoothed Cumulative Precision'] = cumulative_metrics_df['Cumulative Precision'].rolling(window=window_size, min_periods=1).mean()
-    cumulative_metrics_df['Smoothed Cumulative Recall'] = cumulative_metrics_df['Cumulative Recall'].rolling(window=window_size, min_periods=1).mean()
-    cumulative_metrics_df['Smoothed Cumulative F1'] = cumulative_metrics_df['Cumulative F1 Score'].rolling(window=window_size, min_periods=1).mean()
-
-    cumulative_metrics_df['Date'] = pd.to_datetime(cumulative_metrics_df['Date'])
-    cumulative_metrics_df = cumulative_metrics_df.sort_values('Date')
-    
-    plot_cumulative_metrics(cumulative_metrics_df, f'cumulative_metrics{tolerance_str}')
-    
     if X_test is not None and model is not None:
         try:
             probs = model.predict_proba(X_test)
@@ -362,7 +324,7 @@ def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices
     calculate_mean_metrics(total_df)
     rng = np.random.default_rng(seed=RANDOM_STATE)
     for idx in range(10):
-        plot_neu_data_with_labels_predictions(total_df[rng.integers(0, len(total_df))], idx=idx, name=f'comp_preds{tolerance_str}')
-        plot_full_and_zoomed_displacement(total_df[rng.integers(0, len(total_df))], idx=idx, name=f'mean_preds{tolerance_str}')
+        plot_neu_displacements(total_df[rng.integers(0, len(total_df))], idx=idx, name=f'comp_preds{tolerance_str}')
+        plot_neu_mean_displacements(total_df[rng.integers(0, len(total_df))], idx=idx, name=f'mean_preds{tolerance_str}')
         
     return original_test_predictions
