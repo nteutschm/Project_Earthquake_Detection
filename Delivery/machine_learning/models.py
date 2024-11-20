@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import pandas as pd
+import numpy as np
 import joblib
 from sklearn.ensemble import IsolationForest, HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
@@ -17,7 +18,17 @@ from variables import *
 from plots import plot_optimization, plot_eval_metrics
 
 def print_callback(study, trial):
-    '''Print some useful information regarding the hyperparameter optimization'''
+    """
+    A callback function to print useful information regarding the hyperparameter optimization progress. 
+    It outputs the current trial value and parameters, as well as the best value and parameters found so far in the study.
+
+    Parameters:
+    study (optuna.Study): The optimization study object containing the best trial.
+    trial (optuna.Trial): The current trial object being evaluated in the optimization.
+
+    Returns:
+    None
+    """
     print(f"Current value: {trial.value}, Current params: {trial.params}")
     print(f"Best value: {study.best_value}, Best params: {study.best_trial.params}")
     print('-----------------------------------------------------------------------')
@@ -28,11 +39,16 @@ def random_forest(weights):
 
     This function initializes a RandomForestClassifier using pre-defined optimal 
     parameters stored in the BEST_PARAMS_RANDOM_FOREST variable. These parameters 
-    are expected to be set prior to calling this function.
+    are expected to be set prior to calling this function. It also accepts class weights 
+    as a parameter to handle imbalanced classes.
+
+    Parameters:
+    weights (dict): The class weights to be applied to the model. 
 
     Returns:
     RandomForestClassifier: A Random Forest model with optimal settings.
     """
+    
     model = RandomForestClassifier(
         n_estimators=BEST_PARAMS_RANDOM_FOREST['n_estimators'],
         max_depth=BEST_PARAMS_RANDOM_FOREST['max_depth'],
@@ -57,6 +73,7 @@ def isolation_forest():
     Returns:
     IsolationForest: An Isolation Forest model with optimal settings.
     """
+    
     model = IsolationForest(
         n_estimators=BEST_PARAMS_ISOLATION_FOREST['n_estimators'],
         max_samples=BEST_PARAMS_ISOLATION_FOREST['max_samples'],
@@ -71,7 +88,11 @@ def hist_gradient_boosting(weights):
 
     This function initializes a HistGradientBoostingClassifier using pre-defined 
     optimal parameters stored in the BEST_PARAMS_HIST_GRADIENT_BOOSTING variable. 
-    These parameters are expected to be set prior to calling this function.
+    These parameters are expected to be set prior to calling this function. It also accepts class weights 
+    as a parameter to handle imbalanced classes.
+
+    Parameters:
+    weights (dict): The class weights to be applied to the model. 
 
     Returns:
     HistGradientBoostingClassifier: A HistGradientBoosting model with optimal settings.
@@ -95,16 +116,15 @@ def xgboost(y_train):
     This function initializes an XGBClassifier using pre-defined optimal 
     parameters stored in the BEST_PARAMS_XGBOOST variable. These parameters 
     are expected to be set prior to calling this function.
+    
+    Parameters:
+    y_train (pd.Series): The training target variable containing the class labels.
+                         The number of unique classes in y_train is used to set the 
+                         num_class parameter of the XGBoost model.
 
     Returns:
     XGBClassifier: An XGBoost model with optimal settings.
     """
-    cb = callback.EarlyStopping(rounds=5,
-            min_delta=1e-4,
-            save_best=True,
-            maximize=False,
-            data_name="validation_1",
-            metric_name="mlogloss")
     model = XGBClassifier(
         n_estimators=BEST_PARAMS_XGBOOST['n_estimators'],
         max_depth=BEST_PARAMS_XGBOOST['max_depth'],
@@ -116,9 +136,7 @@ def xgboost(y_train):
         max_delta_step=BEST_PARAMS_XGBOOST['max_delta_step'],
         random_state=RANDOM_STATE,
         objective=BEST_PARAMS_XGBOOST['objective'],
-        eval_metric=BEST_PARAMS_XGBOOST['eval_metric'],
         num_class=len(set(y_train)), 
-        callbacks=[cb], 
         reg_alpha=BEST_PARAMS_XGBOOST['reg_alpha'],
         reg_lambda=BEST_PARAMS_XGBOOST['reg_lambda']
     )
@@ -126,16 +144,24 @@ def xgboost(y_train):
 
 def optimize_random_forest(X_train, y_train, X_eval, y_eval, weights):
     """
-    Optimizes a RandomForest classifier using Optuna for hyperparameter tuning.
+    Optimizes and returns a Random Forest model using hyperparameter optimization (Optuna).
+
+    This function optimizes the hyperparameters for a Random Forest model using 
+    Optuna. The function checks whether pre-trained models or optimal parameters 
+    should be used or if hyperparameter optimization should be performed. The 
+    optimization is based on the F1-score (macro average). If a previously 
+    saved study exists, it will be loaded; otherwise, a new study will be created 
+    and optimized over 50 trials. Additionally, optimization plots are generated. 
 
     Parameters:
-    X_train (DataFrame): The training set feature matrix.
-    y_train (Series): The training set target vector.
-    X_eval (DataFrame): The evaluation set feature matrix.
-    y_eval (Series): The evaluation set target vector.
+    X_train (pd.DataFrame): The training features used to train the model.
+    y_train (pd.Series): The training target variable (labels).
+    X_eval (pd.DataFrame): The evaluation features used to evaluate the model during optimization.
+    y_eval (pd.Series): The evaluation target variable (labels).
+    weights (dict): The class weights to handle imbalanced classes.
 
     Returns:
-    RandomForestClassifier: The best RandomForest model after optimization.
+    RandomForestClassifier: The best-trained Random Forest model with the optimal parameters.
     """
 
     if LOAD_MODEL:
@@ -145,9 +171,7 @@ def optimize_random_forest(X_train, y_train, X_eval, y_eval, weights):
     if OPTIMAL_PARAMS:
         print(f'Training RandomForest model using the specified optimal parameters: {BEST_PARAMS_RANDOM_FOREST}')
         model = random_forest(weights)
-        X_combined = pd.concat([X_train, X_eval])
-        y_combined = pd.concat([y_train, y_eval])
-        model.fit(X_combined, y_combined)
+        model.fit(X_train, y_train)
         return model
     
     def objective(trial):
@@ -179,12 +203,15 @@ def optimize_random_forest(X_train, y_train, X_eval, y_eval, weights):
         f1_macro = f1_score(y_eval, y_pred, average='macro')
         return f1_macro
     
-    # Create an Optuna study and optimize
-    sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
-    study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(objective, n_trials=30, callbacks=[print_callback], gc_after_trial=True)
+    if LOAD_STUDY:
+        print('Loading previous study')
+        study = joblib.load(STUDIES)
+    else: 
+        sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
+        study = optuna.create_study(direction='maximize', sampler=sampler)
+        study.optimize(objective, n_trials=50, callbacks=[print_callback], gc_after_trial=True)
+        joblib.dump(study, STUDIES)
     
-    joblib.dump(study, STUDIES)
     print("Best Random Forest parameters found: ", study.best_params)
     
     plot_optimization(study, ('n_estimators', 'max_depth'))
@@ -213,12 +240,13 @@ def optimize_isolation_forest(X_train, y_train):
     the best hyperparameters.
 
     Parameters:
-    X_train (DataFrame): The training set feature matrix.
-    y_train (Series): The training set target vector (required for compatibility).
+    X_train (pd.DataFrame): The training set feature matrix.
+    y_train (pd.Series): The training set target vector (required for compatibility).
 
     Returns:
     IsolationForest: The best Isolation Forest model after optimization.
     """
+
     if LOAD_MODEL:
         print(F'Loading Iolation Forest model from: {MODEL_PATH}')
         return joblib.load(MODEL_PATH)
@@ -246,7 +274,8 @@ def optimize_isolation_forest(X_train, y_train):
 
 def optimize_hist_gradient_boosting(X_train, y_train, weights):
     """
-    Optimizes a HistGradientBoosting classifier using grid search with cross-validation.
+    Optimizes a HistGradientBoosting classifier using grid search with cross-validation and 
+    implementing OneVsRestClassifier. 
 
     The function first checks if a pre-trained model should be loaded based on the 
     LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
@@ -255,8 +284,8 @@ def optimize_hist_gradient_boosting(X_train, y_train, weights):
     the best hyperparameters.
 
     Parameters:
-    X_train (DataFrame): The training set feature matrix.
-    y_train (Series): The training set target vector (0 for no offset, 1 for offset).
+    X_train (pd.DataFrame): The training set feature matrix.
+    y_train (pd.Series): The training set target vector.
     weights (dict): Class weights to handle imbalanced classes.
 
     Returns:
@@ -299,7 +328,7 @@ def optimize_hist_gradient_boosting(X_train, y_train, weights):
     
     return grid_search.best_estimator_
     
-def optimize_xgboost(X_train, y_train, X_eval, y_eval):
+def optimize_xgboost(X_train, y_train, X_eval, y_eval, weights):
     """
     Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
 
@@ -318,6 +347,27 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
     Returns:
     XGBClassifier: The best XGBoost model after optimization.
     """
+    
+    """
+    Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
+
+    This function first checks if a pre-trained model should be loaded based on the 
+    LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
+    specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
+    optimal parameters for training. Otherwise, it will perform Optuna optimization 
+    to identify the best hyperparameters. The optimization is based on the macro F1-score.
+    The optimization includes early stopping and pruning, followed by a visualization of the process. 
+
+    Parameters:
+    X_train (pd.DataFrame): The training set feature matrix.
+    y_train (pd.Series): The training set target vector.
+    X_eval (pd.DataFrame): The evaluation set feature matrix.
+    y_eval (pd.Series): The evaluation set target vector.
+    weights (dict): The class weights to handle imbalanced classes.
+
+    Returns:
+    XGBClassifier: The best XGBoost model after optimization.
+    """
 
     if LOAD_MODEL:
         print(f'Loading XGBoost model from: {MODEL_PATH}')
@@ -326,18 +376,16 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
     if OPTIMAL_PARAMS:
         print(f'Training XGBoost model using the specified optimal parameters: {BEST_PARAMS_XGBOOST}')
         model = xgboost(y_train)
-        model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
-        eval_results = model.evals_result()
-        plot_eval_metrics(eval_results, 'eval_scores')
+        model.fit(X_train, y_train, sample_weight=np.array([weights[label] for label in y_train]), verbose=True)
         return model
     
     def objective(trial):
-        n_estimators = trial.suggest_int('n_estimators', 100, 800)
-        max_depth = trial.suggest_int('max_depth', 5, 30)
-        learning_rate = trial.suggest_float('learning_rate', 0.01, 0.3, log=True)
-        subsample = trial.suggest_float('subsample', 0.5, 1.0)
-        colsample_bytree = trial.suggest_float('colsample_bytree', 0.5, 1.0)
-        gamma = trial.suggest_float('gamma', 0, 10)
+        n_estimators = trial.suggest_int('n_estimators', 150, 750)
+        max_depth = trial.suggest_int('max_depth', 5, 50)
+        learning_rate = trial.suggest_float('learning_rate', 0.001, 0.3, log=True)
+        subsample = trial.suggest_float('subsample', 0.4, 1.0)
+        colsample_bytree = trial.suggest_float('colsample_bytree', 0.1, 1.0)
+        gamma = trial.suggest_float('gamma', 0.0, 10)
         min_child_weight = trial.suggest_int('min_child_weight', 1, 15)
         max_delta_step = trial.suggest_int('max_delta_step', 0, 10)
         reg_alpha = trial.suggest_float('reg_alpha', 0.0, 1.0)
@@ -370,21 +418,23 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
             reg_lambda=reg_lambda
         )
         
-        xgb.fit(X_train, y_train,
+        xgb.fit(X_train, y_train, sample_weight=np.array([weights[label] for label in y_train]), 
                 eval_set=[(X_eval, y_eval)],
                 verbose=False)
 
-        # Evaluate with macro F1 score to balance all classes equally
         y_pred = xgb.predict(X_eval)
         f1_macro = f1_score(y_eval, y_pred, average='macro')
         return f1_macro
     
-    # Create an Optuna study and optimize
-    sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
-    study = optuna.create_study(direction='maximize', sampler=sampler)
-    study.optimize(objective, n_trials=30, callbacks=[print_callback], gc_after_trial=True)
+    if LOAD_STUDY:
+        print('Loading previous study')
+        study = joblib.load(STUDIES)
+    else:
+        sampler = optuna.samplers.TPESampler(seed=RANDOM_STATE)
+        study = optuna.create_study(direction='maximize', sampler=sampler)
+        study.optimize(objective, n_trials=50, callbacks=[print_callback], gc_after_trial=True)
+        joblib.dump(study, STUDIES)
     
-    joblib.dump(study, STUDIES)
     print("Best XGBoost parameters found: ", study.best_params)
     
     plot_optimization(study, ('learning_rate', 'max_depth'))
@@ -396,7 +446,6 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
             data_name="validation_1",
             metric_name="mlogloss")
     
-    # Train the best model on the full training set
     best_params = study.best_params
     best_model = XGBClassifier(
         objective='multi:softprob',
@@ -407,7 +456,7 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval):
         **best_params
     )
     
-    best_model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
+    best_model.fit(X_train, y_train, sample_weight=np.array([weights[label] for label in y_train]), eval_set=[(X_train, y_train), (X_eval, y_eval)], verbose=True)
     eval_results = best_model.evals_result()
     plot_eval_metrics(eval_results, 'eval_scores')
     return best_model
