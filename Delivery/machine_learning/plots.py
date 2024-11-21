@@ -305,7 +305,7 @@ def plot_neu_displacements(df, idx, name, zoom_window=10):
         earthquake_label_added = True
         ax2.bar(df.index, df['preds_sum'], width=2, color='red', alpha=0.3, label='Predictions' if i == 0 and not pred_label_added else "")
         pred_label_added = True
-        axs[i].set_ylabel(f'{component} Displacement', fontsize=label_fontsize)
+        axs[i].set_ylabel(f'{component} Displacement [m]', fontsize=label_fontsize)
         ax2.set_ylabel('Counts', fontsize=label_fontsize)
 
         axs[i].tick_params(axis='y', which='major', labelsize=tick_fontsize)
@@ -343,7 +343,7 @@ def plot_neu_displacements(df, idx, name, zoom_window=10):
             
             earthquake_label_added = True
             pred_label_added = True
-            ax.set_ylabel(f'{component} Displacement', fontsize=label_fontsize)
+            ax.set_ylabel(f'{component} Displacement [m]', fontsize=label_fontsize)
             ax2_zoom.set_ylabel('Counts', fontsize=label_fontsize)
             ax.tick_params(axis='y', which='major', labelsize=tick_fontsize)
             ax2_zoom.tick_params(axis='y', which='major', labelsize=tick_fontsize)
@@ -389,7 +389,7 @@ def plot_neu_mean_displacements(df, name, idx, zoom_window=10):
             axs[i].axvline(pred_date, color='red', linestyle='--', linewidth=2, label="Predicted Earthquake (Mean)" if i == 0 and not pred_label_added else "")
             pred_label_added = True
         
-        axs[i].set_ylabel(f"{component} Displacement", fontsize=label_fontsize)
+        axs[i].set_ylabel(f"{component} Displacement [m]", fontsize=label_fontsize)
         if i == 0:
             axs[i].legend(loc='best', fontsize=legend_fontsize, frameon=False)
         axs[i].grid(True, linestyle='--', alpha=0.5)
@@ -424,7 +424,7 @@ def plot_neu_mean_displacements(df, name, idx, zoom_window=10):
                 axs[i].axvline(pred_date, color='red', linestyle='--', linewidth=2, label="Predicted Earthquake (Mean)" if i == 0 and not pred_label_added else "")
                 pred_label_added = True
             
-            axs[i].set_ylabel(f"{component} Displacement", fontsize=label_fontsize)
+            axs[i].set_ylabel(f"{component} Displacement [m]", fontsize=label_fontsize)
             if i == 0:
                 axs[i].legend(loc='best', fontsize=legend_fontsize, frameon=False)
             axs[i].grid(True, linestyle='--', alpha=0.5)
@@ -528,8 +528,8 @@ def plot_station_geometries(geometries):
         )
     
     ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik)
-    plt.xlabel("Longitude", fontsize=label_fontsize, labelpad=15)
-    plt.ylabel("Latitude", fontsize=label_fontsize, labelpad=15)
+    plt.xlabel("Longitude (EPSG:3857)", fontsize=label_fontsize, labelpad=15)
+    plt.ylabel("Latitude (EPSG:3857)", fontsize=label_fontsize, labelpad=15)
     plt.title("Station Locations by Usage Type", fontsize=title_fontsize, pad=20)
     
     plt.legend(fontsize=legend_fontsize, loc='best', frameon=True, title="Station Types", title_fontsize=18)

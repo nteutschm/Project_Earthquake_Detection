@@ -151,21 +151,7 @@ def read_file(filename):
     
     return data
 
-def add_missing_dates(df):
-    """
-    This function takes a DataFrame with a datetime index and reindexes it to include
-    all dates in the range from the minimum to the maximum date present in the index.
-    Missing dates are filled with NaN values, ensuring that the DataFrame retains its 
-    original structure while providing a complete date range.
-
-    Parameters:
-    df (DataFrame): The input DataFrame with a datetime index that may contain missing dates.
-
-    Returns:
-    DataFrame: A new DataFrame with a complete date range as its index, with NaN values 
-    for any missing dates.
-    """
-    
+def add_missing_dates(df):    
     """
     Reindexes a DataFrame to include all dates in the range from the minimum to 
     the maximum date in its datetime index.
@@ -181,6 +167,7 @@ def add_missing_dates(df):
     - pd.DataFrame: A new DataFrame reindexed with a complete daily date range. 
       The DataFrame retains its original name, and NaN values are added for missing dates.
     """
+    
     df.index = pd.to_datetime(df.index)
     full_date_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
     df_full = df.reindex(full_date_range)
