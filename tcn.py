@@ -14,6 +14,8 @@ import random
 from tensorflow.keras.callbacks import ReduceLROnPlateau, Callback, EarlyStopping
 from tensorflow.keras import backend as K
 from datetime import datetime, timedelta
+from scipy.stats import entropy
+from scipy.signal import find_peaks
 
 EPOCHS_BIN = 120
 EPOCHS_LOC = 120
@@ -586,18 +588,20 @@ def train(training_data_array, time_steps=21, epochs_binary=80, epochs_localizat
     return model_binary, model_localization
 
 
-def unchunk_and_plot(X_test, y_pred_probs, y_bin_labels, station_ids, window_size=21):
+def unchunk_and_plot(X_test, y_pred_probs, y_pred_loc, y_bin_labels, station_ids, window_size=21):
     station_data = {}
 
     # Step 1: Create N, E, U series for each station
-    for i, (x, y_prob, y_label, station_id) in enumerate(zip(X_test, y_pred_probs, y_bin_labels, station_ids)):
+    for i, (x, y_prob, y_loc, y_label, station_id) in enumerate(zip(X_test, y_pred_probs, y_pred_loc, y_bin_labels, station_ids)):
         if station_id not in station_data:
             station_data[station_id] = {
                 'N': list(x[:, 0]),  # Start with the first 21 coordinates for N
                 'E': list(x[:, 1]),  # Start with the first 21 coordinates for E
                 'U': list(x[:, 2]),  # Start with the first 21 coordinates for U
                 'binary_preds': [],   # Store the binary prediction values
-                'binary_label': []   # Store the binary test labels
+                'binary_label': [],   # Store the binary test labels
+                'loc_preds': [],   # Store the localization prediction values
+                'loc_entropy': [],   # Store the localization entropy values
             }
 
         else:
@@ -609,10 +613,16 @@ def unchunk_and_plot(X_test, y_pred_probs, y_bin_labels, station_ids, window_siz
         # Store the prediction for this window
         station_data[station_id]['binary_preds'].append(y_prob)
         station_data[station_id]['binary_label'].append(y_label)
+        station_data[station_id]['loc_preds'].append(y_loc)
+        station_data[station_id]['loc_entropy'].append(1 - (entropy(y_loc)/3.0445224377234217))
+
 
     # Step 2: Create the binary matrix for each station
     summed_predictions = {}
     summed_labels = {}
+    summed_localizations = {}
+    summed_entropy = {}
+
     for station_id, data in station_data.items():
         num_days = len(data['N'])
         num_windows = len(data['binary_preds'])
@@ -620,6 +630,8 @@ def unchunk_and_plot(X_test, y_pred_probs, y_bin_labels, station_ids, window_siz
         # Initialize a binary matrix with zeros
         binary_matrix = np.zeros((num_windows, num_days))
         label_matrix = np.zeros((num_windows, num_days))
+        loc_matrix = np.zeros((num_windows, num_days))
+        entropy_matrix = np.zeros((num_windows, num_days))
 
         # Step 3: Assign predicted binary values to the matrix
         for window_index, y_pred in enumerate(data['binary_preds']):
@@ -634,19 +646,136 @@ def unchunk_and_plot(X_test, y_pred_probs, y_bin_labels, station_ids, window_siz
             # Assign y_pred to the appropriate slice in the row
             label_matrix[window_index, start_index:end_index] = y_label
 
+        for window_index, y_loc in enumerate(data['loc_preds']):
+            start_index = window_index
+            end_index = start_index + window_size
+            # Assign y_pred to the appropriate slice in the row
+            loc_matrix[window_index, start_index:end_index] = y_loc
+
+        for window_index, y_entropy in enumerate(data['loc_entropy']):
+            start_index = window_index
+            end_index = start_index + window_size
+            # Assign y_pred to the appropriate slice in the row
+            entropy_matrix[window_index, start_index:end_index] = y_entropy
+
         # Sum the binary matrix along the columns to get the final summed prediction per day
-        summed_predictions[station_id] = np.sum(binary_matrix, axis=0)
         summed_labels[station_id] = np.sum(label_matrix, axis=0)
 
+        summed_predictions[station_id] = np.sum(binary_matrix, axis=0)
+        summed_localizations[station_id] = np.sum(loc_matrix, axis=0)
+        summed_entropy[station_id] = np.sum(entropy_matrix, axis=0)
 
-        selected_stations = random.sample(list(station_data.keys()), 8)
-    
+    global_max_prediction = max([np.max(arr) for arr in summed_predictions.values()])
+    global_max_localization = max([np.max(arr) for arr in summed_localizations.values()])
+    global_max_entropy = max([np.max(arr) for arr in summed_entropy.values()])
+
+    # Step 2: Normalize all arrays using the global maximums
+    def normalize_list(arr, global_max):
+        if global_max == 0:
+            return arr  # Avoid division by zero; if all elements are 0, return the original array.
+        return arr / global_max
+
+    summed_total = {}
+
+    for station_id in summed_predictions.keys():
+        # Normalize using the global maximums
+        normalized_predictions = normalize_list(summed_predictions[station_id], global_max_prediction)
+        normalized_localizations = normalize_list(summed_localizations[station_id], global_max_localization)
+        normalized_entropy = normalize_list(summed_entropy[station_id], global_max_entropy)
+        
+        # Sum the normalized arrays
+        summed_total[station_id] = (
+            normalized_predictions +
+            normalized_localizations +
+            normalized_entropy
+        )
+
+    # Metrics storage for each window size
+    metrics = {
+        '0_days': {'TP': 0, 'FP': 0, 'TN': 0, 'FN': 0},
+        '1_day': {'TP': 0, 'FP': 0, 'TN': 0, 'FN': 0},
+        '5_days': {'TP': 0, 'FP': 0, 'TN': 0, 'FN': 0},
+        '20_days': {'TP': 0, 'FP': 0, 'TN': 0, 'FN': 0}
+    }
+
+    # Iterate through each station
+    for station_id in summed_labels.keys():
+        station_length = len(summed_labels[station_id])  # Length of the time series
+        true_offset_pos = np.where(summed_labels[station_id] > 20.5)[0]  # True offsets
+        
+        # Find predicted positions: local maximas above threshold (1.5) with 21-day window
+        threshold = 1.15
+        peak_indices, _ = find_peaks(summed_total[station_id], height=threshold, distance=21)
+
+        for window_name, window_size in [('0_days', 0), ('1_day', 1), ('5_days', 5), ('20_days', 20)]:
+            TP = 0  # True Positives
+            FP = 0  # False Positives
+            FN = 0  # False Negatives
+            TN = 0  # True Negatives
+
+            detected_offsets = []  # Track detected true offsets
+
+            # Count TP and FN
+            for true_pos in true_offset_pos:
+                if any(abs(pred - true_pos) <= window_size for pred in peak_indices):
+                    TP += 1
+                    detected_offsets.append(true_pos)
+                else:
+                    FN += 1
+
+            # Count FP
+            for pred in peak_indices:
+                if not any(abs(pred - true_pos) <= window_size for true_pos in true_offset_pos):
+                    FP += 1
+
+            # Count TN
+            predicted_and_true = set(peak_indices).union(set(true_offset_pos))
+            TN = station_length - len(predicted_and_true)
+
+            # Store metrics
+            metrics[window_name]['TP'] += TP
+            metrics[window_name]['FP'] += FP
+            metrics[window_name]['TN'] += TN
+            metrics[window_name]['FN'] += FN
+
+    # Print the metrics
+    for window_name, data in metrics.items():
+        print(f"Metrics for {window_name} window:")
+        print(f"  True Positives (TP): {data['TP']}")
+        print(f"  False Positives (FP): {data['FP']}")
+        print(f"  True Negatives (TN): {data['TN']}")
+        print(f"  False Negatives (FN): {data['FN']}\n")
+
+    classification_reports = {}
+    for window_name, data in metrics.items():
+        TP = data['TP']
+        FP = data['FP']
+        TN = data['TN']
+        FN = data['FN']
+        
+        # Calculate the required metrics
+        y_true = [1] * (TP + FN) + [0] * (TN + FP)  # True labels
+        y_pred = [1] * TP + [0] * FN + [0] * TN + [1] * FP  # Predicted labels
+        
+        # Create the classification report
+        report = classification_report(y_true, y_pred, target_names=["No Offset", "Offset"], zero_division=0)
+        classification_reports[window_name] = report
+
+    # Print the classification reports
+    for window_name, report in classification_reports.items():
+        print(f"Classification Report for {window_name} window:")
+        print(report)
+        print("\n")
+
+
+
+    # plot random stations
+    selected_stations = random.sample(list(station_data.keys()), 1)
     for station_id in selected_stations:
         data = station_data[station_id]
         days = range(len(data['N']))  # X-axis (days)
-        summed_pred = summed_predictions[station_id]  # Summed binary predictions
-        summed_lab = summed_labels[station_id]
-        true_offset_pos = np.where(summed_lab > 20.5)[0]
+        summed_pred = summed_total[station_id]  # Summed binary predictions
+        true_offset_pos = np.where(summed_labels[station_id] > 20.5)[0]
         
         # Adjust the figure size to better fit the screen
         fig, axes = plt.subplots(3, 1, figsize=(12, 8))
@@ -656,7 +785,7 @@ def unchunk_and_plot(X_test, y_pred_probs, y_bin_labels, station_ids, window_siz
         series_labels = ['N', 'E', 'U']
         for i, label in enumerate(series_labels):
             ax = axes[i]
-            ax.plot(days, data[label], label=f'{label} Series', color='blue')
+            ax.plot(days[80:120], data[label][80:120], label=f'{label} Series', color='blue')
             ax.set_xlabel('Days')
             ax.set_ylabel(f'{label} Coordinate')
             if len(true_offset_pos) > 0:
@@ -665,8 +794,8 @@ def unchunk_and_plot(X_test, y_pred_probs, y_bin_labels, station_ids, window_siz
 
             # Secondary y-axis for summed predictions
             ax2 = ax.twinx()
-            ax2.bar(days, summed_pred, alpha=0.4, color='orange', label='Summed Predictions')
-            ax2.set_ylabel('Summed Predictions')
+            ax2.bar(days[80:120], summed_pred[80:120], alpha=0.4, color='lawngreen', label= 'Total Score')
+            ax2.set_ylabel('Total Score')
 
             # Legends and grid
             ax.legend(loc='upper left', fontsize=10)
@@ -691,8 +820,6 @@ def test(test_data_array, model_binary_path, model_localization_path, time_steps
     """
 
     X_test, y_test_binary, y_test_localization , test_stations_ids = test_data_array[0], test_data_array[1], test_data_array[2], test_data_array[3]
-    print(X_test.shape)
-    print(y_test_binary.shape)
 
     model_binary = load_model(model_binary_path, custom_objects={'focal_loss': focal_loss})
     model_localization = load_model(model_localization_path, custom_objects={'distance_penalized_mse': distance_penalized_mse})
@@ -783,7 +910,6 @@ def test(test_data_array, model_binary_path, model_localization_path, time_steps
                 localization_false_counts[true_position] += 1
 
         # Calculate percentages
-        print(binary_true_counts, binary_false_counts)
         binary_true_percentage = binary_true_counts / (binary_true_counts + binary_false_counts) * 100
         binary_false_percentage = binary_false_counts / (binary_true_counts + binary_false_counts) * 100
         localization_true_percentage = localization_true_counts / (localization_true_counts + localization_false_counts) * 100
@@ -811,7 +937,7 @@ def test(test_data_array, model_binary_path, model_localization_path, time_steps
         plt.show()
 
         # Example usage (assuming you already have X_test, y_test_binary, and station_ids):
-        unchunk_and_plot(X_test, y_pred_probs, y_test_binary, test_stations_ids)        
+        unchunk_and_plot(X_test, y_pred_probs, y_pred_localization, y_test_binary, test_stations_ids)        
 
     return binary_cm, localization_cm, difference_days
 
