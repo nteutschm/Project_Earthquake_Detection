@@ -422,14 +422,16 @@ def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices
         except AttributeError:
             print("AUC score calculation skipped, as the model does not support probabilities.")
 
-    if model is not None and hasattr(model, 'feature_importances_'):
-        non_chunked_columns = ['latitude', 'cos_longitude', 'sin_longitude', 'height']
-        chunked_columns = [col for col in USED_COLS if col not in non_chunked_columns]
+    if model is not None and hasattr(model, 'feature_importances_') and tolerance_window is None:
+        non_chunked_columns = [col for col in USED_COLS if col in ['latitude', 'cos_longitude', 'sin_longitude', 'height']]
+        chunked_columns = [col for col in USED_COLS if col not in ['latitude', 'cos_longitude', 'sin_longitude', 'height']]
         feature_importances = model.feature_importances_
 
         chunked_importances = feature_importances[:len(chunked_columns) * chunk_size].reshape(-1, len(chunked_columns))
         non_chunked_importances = feature_importances[len(chunked_columns) * chunk_size:]
         averaged_importances = np.concatenate([np.mean(chunked_importances, axis=0), non_chunked_importances])
+        
+        plot_feature_importances(importances=averaged_importances, columns=chunked_columns + non_chunked_columns, name='feature_importances')
 
         print(f"Averaged Feature Importances for used columns {chunked_columns + non_chunked_columns}: \n{averaged_importances}")
         

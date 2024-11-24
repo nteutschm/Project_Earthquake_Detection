@@ -76,15 +76,15 @@ BEST_PARAMS_HIST_GRADIENT_BOOSTING = {
     'validation_fraction': 0.1
 }
 
-BEST_PARAMS_XGBOOST = {'n_estimators': 532, 
+BEST_PARAMS_XGBOOST = {'n_estimators': 723, 
                        'max_depth': 33, 
-                       'learning_rate': 0.0028776368705155514, 
-                       'subsample': 0.44233488330876214, 
-                       'colsample_bytree': 0.3999568445429576, 
-                       'gamma': 8.63353744627308, 
-                       'min_child_weight': 12, 
-                       'max_delta_step': 6, 
-                       'reg_alpha': 0.10269305957318663, 
-                       'reg_lambda': 0.783059356132089,
+                       'learning_rate': 0.010854349845439646, 
+                       'subsample': 0.9363652650420417, 
+                       'colsample_bytree': 0.3930726990720387, 
+                       'gamma': 9.827001352684102, 
+                       'min_child_weight': 11, 
+                       'max_delta_step': 10, 
+                       'reg_alpha': 0.9887482435498209, 
+                       'reg_lambda': 2.316773917657474,
                        'objective':'multi:softprob',
                        'eval_metric':'mlogloss'}

@@ -48,7 +48,7 @@ def plot_eval_metrics(eval_results, name):
     
     plt.tight_layout()
     plt.savefig(f'{PLOTS_PATH}_{name}.png', dpi=dpi_setting)
-    plt.close()
+    plt.close(fig)
     
 def plot_optimization(study, parameters):
     """
@@ -64,7 +64,7 @@ def plot_optimization(study, parameters):
     None
     """
     
-    plt.figure(figsize=subplot_size)
+    fig, ax = plt.subplots(figsize=subplot_size)
     ax = plot_optimization_history(study, target_name='Validation loss')
     ax.set_xlabel('Trial', fontsize=label_fontsize)
     ax.set_ylabel('Validation loss (Macro F1 Score)', fontsize=label_fontsize)
@@ -73,18 +73,20 @@ def plot_optimization(study, parameters):
     ax.legend(fontsize=legend_fontsize)
     plt.tight_layout()
     plt.savefig(PLOTS_PATH + 'optimization_history.png', dpi=dpi_setting)
+    plt.close(fig)
     
-    plt.figure(figsize=subplot_size)
+    fig, ax = plt.subplots(figsize=subplot_size, layout='constrained')
     ax = plot_param_importances(study)
     ax.set_xlabel('Importance for validation loss', fontsize=label_fontsize)
     ax.set_ylabel('Hyperparameter', fontsize=label_fontsize)
-    ax.set_title(f'Hyperparameter Importances for {MODEL_TYPE}', fontsize=title_fontsize, pad=20)
+    #ax.set_title(f'Importances for {MODEL_TYPE}', fontsize=title_fontsize, pad=20) leads to overlapping titles
     ax.tick_params(axis='both', which='major', labelsize=tick_fontsize)
     ax.legend(fontsize=legend_fontsize)
     plt.tight_layout()
     plt.savefig(PLOTS_PATH + 'parameter_importances.png', dpi=dpi_setting)
+    plt.close(fig)
     
-    plt.figure(figsize=subplot_size)
+    fig, ax = plt.subplots(figsize=subplot_size)
     ax = plot_contour(study, params=[parameters[0], parameters[1]], target_name='Validation loss')
     ax.set_xlabel(' '.join([word.capitalize() for word in parameters[0].replace('_', ' ').split()]), fontsize=label_fontsize)
     ax.set_ylabel(' '.join([word.capitalize() for word in parameters[1].replace('_', ' ').split()]), fontsize=label_fontsize)
@@ -93,6 +95,7 @@ def plot_optimization(study, parameters):
     ax.legend(fontsize=legend_fontsize)
     plt.tight_layout()
     plt.savefig(PLOTS_PATH + 'contour.png', dpi=dpi_setting)
+    plt.close(fig)
     
 def plot_histogram(series, xlabel, ylabel, title, name):
     """
@@ -260,7 +263,7 @@ def plot_statistics(report, name):
 
     plt.xlabel('Classes', fontsize=label_fontsize, labelpad=15)
     plt.ylabel('Scores', fontsize=label_fontsize, labelpad=15)
-    plt.xticks(positions, class_labels, rotation=45, ha='right', fontsize=tick_fontsize)
+    plt.xticks(positions, class_labels, rotation=45, ha='center', fontsize=tick_fontsize)
     plt.yticks(fontsize=tick_fontsize)
     plt.title('Precision, Recall, and F1 Scores per Class', fontsize=title_fontsize, pad=20)
     
@@ -269,6 +272,38 @@ def plot_statistics(report, name):
     plt.tight_layout()
     plt.savefig(f'{PLOTS_PATH}_{name}.png', dpi=dpi_setting)
     plt.close()
+    
+def plot_feature_importances(importances, columns, name):
+    """
+    Plots feature importances of a trained model.
+    The resulting visualization is saved as a PNG file using the specified name and PLOTS_PATH.
+
+    Parameters:
+    - importances (ndarray): Feature importances as computed by the model.
+    - columns (list): Feature names corresponding to the importances.
+    - name (str): The name used for saving the PNG file using the PLOTS_PATH variable.
+
+    Returns:
+    None
+    """
+    importance_df = pd.DataFrame({
+        "Feature": columns,
+        "Importance": importances
+    }).sort_values(by="Importance", ascending=False)
+    
+    fig, ax = plt.subplots(figsize=plot_size)
+    sns.barplot(data=importance_df, x="Importance", y="Feature", color='#4c9fdb', ax=ax)
+    plt.title('Averaged Feature Importances over Chunks', fontsize=title_fontsize, pad=20)
+    plt.xlabel("Average Importance", fontsize=label_fontsize, labelpad=15)
+    plt.ylabel("Features", fontsize=label_fontsize, labelpad=15)
+    plt.xticks(rotation=45, ha='center', fontsize=tick_fontsize)
+    plt.yticks(fontsize=tick_fontsize)
+    
+    plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png', dpi=dpi_setting)
+    plt.close(fig)
+    
 
 def plot_neu_displacements(df, idx, name, zoom_window=10):
     """
@@ -317,7 +352,7 @@ def plot_neu_displacements(df, idx, name, zoom_window=10):
     axs[-1].tick_params(axis='x', which='major', labelsize=tick_fontsize, rotation=45)
     plt.tight_layout()
     plt.savefig(f'{PLOTS_PATH}_{name}{idx}.png', dpi=dpi_setting)
-    plt.close()
+    plt.close(fig)
 
     # Zoomed-In Plot(s)
     zoom_dates = df[df['labels_sum'] > 0].index
@@ -354,7 +389,7 @@ def plot_neu_displacements(df, idx, name, zoom_window=10):
         axs[-1].tick_params(axis='x', which='major', labelsize=tick_fontsize, rotation=45)
         plt.tight_layout()
         plt.savefig(f'{PLOTS_PATH}_{name}_zoom_{idx}_{j}.png', dpi=dpi_setting)
-        plt.close()
+        plt.close(fig)
 
 def plot_neu_mean_displacements(df, name, idx, zoom_window=10):
     """
@@ -399,7 +434,7 @@ def plot_neu_mean_displacements(df, name, idx, zoom_window=10):
     plt.xticks(rotation=45, fontsize=tick_fontsize)
     plt.tight_layout()
     plt.savefig(f'{PLOTS_PATH}_{name}_{idx}.png', dpi=dpi_setting)
-    plt.close()
+    plt.close(fig)
 
     # Zoomed-in plot(s)
     zoom_dates = df[df['labels_sum'] > 0].index
@@ -434,7 +469,7 @@ def plot_neu_mean_displacements(df, name, idx, zoom_window=10):
         plt.xticks(rotation=45, fontsize=tick_fontsize)
         plt.tight_layout()
         plt.savefig(f'{PLOTS_PATH}_{name}_zoom_{idx}.png', dpi=dpi_setting)
-        plt.close()
+        plt.close(fig)
         
 def plot_mean_preds_statistics(values, name, chunk_size=CHUNK_SIZE):
     """
@@ -535,7 +570,7 @@ def plot_station_geometries(geometries):
     plt.legend(fontsize=legend_fontsize, loc='best', frameon=True, title="Station Types", title_fontsize=18)
     ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
     plt.savefig(f'{PLOTS_PATH}_stations.png', dpi=dpi_setting, bbox_inches='tight')
-    plt.close()
+    plt.close(fig)
     
 
 
