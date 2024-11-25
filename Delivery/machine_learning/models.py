@@ -339,25 +339,6 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval, weights):
     """
     Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
 
-    The function first checks if a pre-trained model should be loaded based on the 
-    LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
-    specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
-    optimal parameters for training. Otherwise, it will perform Optuna optimization to 
-    identify the best hyperparameters.
-
-    Parameters:
-    X_train (DataFrame): The training set feature matrix.
-    y_train (Series): The training set target vector.
-    X_eval (DataFrame): The evaluation set feature matrix.
-    y_eval (Series): The evaluation set target vector.
-
-    Returns:
-    XGBClassifier: The best XGBoost model after optimization.
-    """
-    
-    """
-    Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
-
     This function first checks if a pre-trained model should be loaded based on the 
     LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
     specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
