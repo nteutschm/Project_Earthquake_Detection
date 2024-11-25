@@ -1,5 +1,5 @@
-#!/usr/bin/env python
-# coding: utf-8
+#!/usr/bin/env pyth
+
 
 
 # Path to the data
@@ -88,3 +88,5 @@ BEST_PARAMS_XGBOOST = {'n_estimators': 532,
                        'reg_lambda': 0.783059356132089,
                        'objective':'multi:softprob',
                        'eval_metric':'mlogloss'}
+
+                    

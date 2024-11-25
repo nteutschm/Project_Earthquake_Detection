@@ -10,11 +10,18 @@ from sklearn.multiclass import OneVsRestClassifier
 from xgboost import XGBClassifier, callback
 from sklearn.metrics import f1_score
 import optuna
+import tensorflow as tf
+from keras.models import Model
+from keras.layers import Dense, Input, GlobalAveragePooling1D, Conv1D, BatchNormalization, ReLU
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import ReduceLROnPlateau, Callback, EarlyStopping
+
+
 
 # Runs in the backgound:
 import optuna.integration # pip install optuna-integration[xgboost]
 
-from variables import *
+from variables_tcn import *
 from plots import plot_optimization, plot_eval_metrics
 
 def print_callback(study, trial):
@@ -460,3 +467,66 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval, weights):
     eval_results = best_model.evals_result()
     plot_eval_metrics(eval_results, 'eval_scores')
     return best_model
+
+def distance_penalized_mse(y_true, y_pred):
+    # Get the true and predicted offset positions by finding the index of the max value in each sequence
+    true_position = tf.argmax(y_true, axis=-1)
+    pred_position = tf.argmax(y_pred, axis=-1)
+    # Calculate the absolute difference between true and predicted positions
+    distances = tf.abs(tf.cast(true_position - pred_position, tf.float32))
+    # Apply a penalty proportional to the distance (increase MSE for farther predictions)
+    penalties = distances + 1  # Adding 1 to avoid multiplying by zero
+    # Compute the mean squared error and apply the penalty
+    mse = tf.square(y_true - y_pred)
+    penalized_mse = mse * tf.expand_dims(penalties, axis=-1)  # Expand dimensions for broadcasting
+    
+    return tf.reduce_mean(penalized_mse)
+
+def focal_loss(alpha=0.25, gamma=2.0):
+    def loss(y_true, y_pred):
+        cross_entropy = K.binary_crossentropy(y_true, y_pred)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        modulating_factor = K.pow((1 - p_t), gamma)
+        alpha_weight_factor = y_true * alpha + (1 - y_true) * (1 - alpha)
+        return alpha_weight_factor * modulating_factor * cross_entropy
+    return loss
+
+def build_localization_model_tcn(input_shape, time_steps=21, filters=32, kernel_size=3, dilation_rate=1):
+    input_layer = Input(shape=input_shape)
+    x = input_layer
+
+    # Temporal Convolutional Layers
+    for i in range(3):  # Three layers, can adjust
+        x = Conv1D(filters=filters, kernel_size=kernel_size, dilation_rate=dilation_rate, padding="causal")(x)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        dilation_rate *= 2  # Increase dilation rate exponentially
+
+    # Global pooling to reduce to single vector
+    x = GlobalAveragePooling1D()(x)
+
+    # Output layer for localization
+    localization_output = Dense(time_steps, activation='softmax')(x)
+
+    model = Model(inputs=input_layer, outputs=localization_output)
+    model.compile(optimizer='adam', loss=distance_penalized_mse, metrics=['accuracy'])
+    return model
+
+def build__binary_model_tcn(input_shape, filters=64, kernel_size=5, dilation_rate=1):
+    input_layer = Input(shape=input_shape)
+    x = input_layer
+
+    for i in range(5):  # Increase the number of layers
+        x = Conv1D(filters=filters, kernel_size=kernel_size, dilation_rate=dilation_rate, padding="causal")(x)
+        x = BatchNormalization()(x)
+        x = ReLU()(x)
+        dilation_rate *= 2
+
+    x = GlobalAveragePooling1D()(x)
+    binary_output = Dense(1, activation='sigmoid')(x)
+
+    model = Model(inputs=input_layer, outputs=binary_output)
+    # Use the focal_loss function by calling it to create the actual loss function
+    model.compile(optimizer='adam', loss=focal_loss(alpha=0.25, gamma=2.0), metrics=['accuracy'])
+
+    return model

@@ -17,8 +17,8 @@ from datetime import datetime, timedelta
 from scipy.stats import entropy
 from scipy.signal import find_peaks
 
-EPOCHS_BIN = 120
-EPOCHS_LOC = 120
+EPOCHS_BIN = 1
+EPOCHS_LOC = 1
 TIME_STEPS = 21
 RANDOM_STATE = 10
 MIN_OFFSET = 5
@@ -352,7 +352,10 @@ def prepare_lstm_data(X, y_binary=None, y_localization=None, time_steps=21, bala
     Returns:
     Tuple: Prepared input features, and optionally binary and localization labels.
     """
-    num_features = 3  # Assuming features are N, E, U
+    print(X.shape)
+    print(X[0])
+    print(X)
+    num_features = int(X.shape[1]/time_steps)  # Assuming features are N, E, U
 
     # Reshape X to (num_samples, time_steps, num_features)
     X_lstm = X.values.reshape(-1, time_steps, num_features, order='F')
@@ -501,8 +504,6 @@ def split(X, y_binary, y_localization, station_id_vector, time_steps=21, random_
     y_train_binary_raw, y_test_binary_raw = y_binary[:split_index], y_binary[split_index:]
     y_train_localization_raw, y_test_localization_raw = y_localization[:split_index], y_localization[split_index:]
     station_id_train, station_id_test = station_id_vector[:split_index], station_id_vector[split_index:]
-    print(len(X_train_raw))
-    print(len(X_test_raw))
     
     # Prepare the training data (with resampling)
     X_train, y_train_binary, y_train_localization = prepare_lstm_data(pd.DataFrame(X_train_raw), y_train_binary_raw, y_train_localization_raw, time_steps, balance=True, random_state=random_state)
@@ -962,4 +963,4 @@ training_data, testing_data = split(features, target, localization, station_id_v
 print("training...")
 #model_binary, model_localization = train(training_data, time_steps=TIME_STEPS, epochs_binary=EPOCHS_BIN, epochs_localization=EPOCHS_LOC, model_save_path_binary=MODEL_BINARY_SAVE_PATH, model_save_path_localization=MODEL_LOC_SAVE_PATH, plot_losses=True)
 print("testing...")
-binary_cm, localization_cm, difference_days = test(testing_data, MODEL_BINARY_SAVE_PATH, MODEL_LOC_SAVE_PATH, time_steps=TIME_STEPS, random_state=RANDOM_STATE, enhanced_evaluation=True)
+binary_cm, localization_cm, difference_days = test(testing_data, MODEL_BINARY_SAVE_PATH, MODEL_LOC_SAVE_PATH, time_steps=TIME_STEPS, random_state=RANDOM_STATE, enhanced_evaluation=False)
