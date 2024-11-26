@@ -344,7 +344,7 @@ def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices
 
         for i in range(len(test_labels_np)):
             # Check if the actual label is an earthquake (index > 0) and it was misclassified
-            if test_labels_np[i] > 0 and test_predictions_np[i] != test_labels_np[i]:
+            if test_labels_np[i] > 0 and test_predictions_np[i] > 0 and test_predictions_np[i] != test_labels_np[i]:
                 if abs(test_predictions_np[i] - test_labels_np[i]) <= tolerance_window:
                     test_predictions_np[i] = test_labels_np[i]
 
