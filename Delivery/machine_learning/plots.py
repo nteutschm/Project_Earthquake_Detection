@@ -9,7 +9,7 @@ import contextily as ctx
 import geopandas as gpd
 from optuna.visualization.matplotlib import plot_optimization_history, plot_param_importances, plot_contour
 
-from variables_tcn import *
+from variables import *
 
 # Define standard font sizes and other plotting parameters for consistency
 legend_fontsize = 16

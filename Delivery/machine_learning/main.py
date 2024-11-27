@@ -60,14 +60,17 @@ def prepare_data(X, y, start_index, stations, geometries):
     """
     
     rng = np.random.default_rng(seed=RANDOM_STATE)
+    impl_cols = USED_COLS.copy()
     if TRAIN_NA:
         print('The model will be trained using stations in North America and then tested on stations in New Zealand')
-        assert 'latitude' in USED_COLS and 'cos_longitude' in USED_COLS and 'sin_longitude' in USED_COLS, 'Not all location features are in the data, check that latitude, cos_longitude and sin_longitude are in USED_COLS'
+        assert 'latitude' in impl_cols and 'cos_longitude' in impl_cols and 'sin_longitude' in impl_cols, 'Not all location features are in the data, check that latitude, cos_longitude and sin_longitude are in USED_COLS'
         expected_geo_columns = ['latitude', 'sin_longitude', 'cos_longitude', 'height']
-        num_geo_cols = sum(col in USED_COLS for col in expected_geo_columns)
-        location = X.columns[-num_geo_cols:]
-        if 'height' in USED_COLS:
-            location = location[:-1]
+        num_geo_cols = sum(col in impl_cols for col in expected_geo_columns)
+        tot_location = X.columns[-num_geo_cols:]
+        if 'height' in impl_cols:
+            location = tot_location[:-1]
+        else:
+            location = tot_location
         
         latitude = X[location[0]]
         cos_longitude = X[location[1]]
@@ -77,8 +80,22 @@ def prepare_data(X, y, start_index, stations, geometries):
         north_america_mask = (latitude > 0) & (longitude >= -180) & (longitude <= -100)
         new_zealand_mask = (latitude >= -50) & (latitude <= -30) & (longitude >= 165) & (longitude <= 180)
         
+        if EXCLUDE_LOC:
+            X = X.drop(columns=tot_location)
+            impl_cols = [col for col in impl_cols if col not in expected_geo_columns]
+        
         train_mask = north_america_mask
-        test_mask = new_zealand_mask
+
+        nz_stations = [stations[i] for i in range(len(stations)) if new_zealand_mask[i]]
+        unique_nz_stations = sorted(list(set(nz_stations)))
+        unique_nz_stations = rng.permutation(unique_nz_stations)
+
+        n_eval = len(unique_nz_stations) // 2
+        eval_stations = unique_nz_stations[:n_eval]
+        test_stations = unique_nz_stations[n_eval:]
+
+        eval_mask = [stations[i] in eval_stations for i in range(len(stations))]
+        test_mask = [stations[i] in test_stations for i in range(len(stations))]
         
         X_train = X[train_mask]
         y_train = [y[i] for i in range(len(y)) if train_mask[i]]
@@ -87,13 +104,20 @@ def prepare_data(X, y, start_index, stations, geometries):
         X_test = X[test_mask]
         y_test = [y[i] for i in range(len(y)) if test_mask[i]]
         geometries_test = [geometries[i] for i in range(len(geometries)) if test_mask[i]]
-
-        # No evaluation set as TRAIN_NA splits are strictly between two regions
-        X_eval, y_eval, geometries_eval, eval_stations = pd.DataFrame(), [], [], []
+        
+        X_eval = X[eval_mask]
+        y_eval = [y[i] for i in range(len(y)) if eval_mask[i]]
+        geometries_eval = [geometries[i] for i in range(len(geometries)) if eval_mask[i]]
         
         test_start_index = [start_index[i] for i in range(len(start_index)) if test_mask[i]]
         train_stations = [stations[i] for i in range(len(stations)) if train_mask[i]]
         test_stations = [stations[i] for i in range(len(stations)) if test_mask[i]]
+        eval_stations = [stations[i] for i in range(len(stations)) if eval_mask[i]]
+        
+        if OPTIMAL_PARAMS:
+            # Delete evaluation sets, as the algorithm should not be trained using stations from new zealand, 
+            # but the evaluation should also not be applied on stations it already has seen during optimization
+            X_eval, y_eval, geometries_eval, eval_stations = pd.DataFrame(), [], [], []
     else: 
         unique_stations = sorted(list(set(stations))) 
         unique_stations = rng.permutation(unique_stations) 
@@ -147,8 +171,8 @@ def prepare_data(X, y, start_index, stations, geometries):
 
         expected_geo_columns = ['latitude', 'sin_longitude', 'cos_longitude', 'height']
 
-        if any(col in USED_COLS for col in expected_geo_columns):
-            num_geo_cols = sum(col in USED_COLS for col in expected_geo_columns)
+        if any(col in impl_cols for col in expected_geo_columns):
+            num_geo_cols = sum(col in impl_cols for col in expected_geo_columns)
             geo_columns = X.columns[-num_geo_cols:]
 
         if not isinstance(geo_columns, list):
@@ -194,7 +218,7 @@ def prepare_data(X, y, start_index, stations, geometries):
     class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
     class_weights = {c: w for c, w in zip(classes, class_weights)}
     
-    return pd.DataFrame(X_train), pd.DataFrame(X_eval), pd.DataFrame(X_test), pd.Series(y_train), pd.Series(y_eval), pd.Series(y_test), class_weights, test_start_index, test_stations, (geometries_train, geometries_eval, geometries_test)
+    return pd.DataFrame(X_train), pd.DataFrame(X_eval), pd.DataFrame(X_test), pd.Series(y_train), pd.Series(y_eval), pd.Series(y_test), class_weights, test_start_index, test_stations, (geometries_train, geometries_eval, geometries_test), impl_cols
 
 def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries):
     """
@@ -232,7 +256,7 @@ def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries
     - 'XGBoost': A highly efficient and scalable gradient boosting framework.
     """
     
-    X_train, X_eval, X_test, y_train, y_eval, y_test, weights, test_start_index, test_stations, geometries = prepare_data(X, y, start_index, stations, geometries)
+    X_train, X_eval, X_test, y_train, y_eval, y_test, weights, test_start_index, test_stations, geometries, impl_cols = prepare_data(X, y, start_index, stations, geometries)
 
     if model_type == 'IsolationForest':
         model = optimize_isolation_forest(X_train, y_train)
@@ -263,7 +287,7 @@ def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries
         data.to_csv(path, index=True)
     
     for window in [None, 1]:
-        test_predictions = evaluate(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window, cleaned_dfs=cleaned_dfs, stations=test_stations, start_indices=test_start_index)
+        test_predictions = evaluate(test_predictions, test_labels, model=model, X_test=X_test, tolerance_window=window, cleaned_dfs=cleaned_dfs, stations=test_stations, start_indices=test_start_index, impl_cols=impl_cols)
     
     return model, geometries
 
