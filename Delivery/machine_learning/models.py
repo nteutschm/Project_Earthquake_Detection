@@ -23,7 +23,7 @@ from tensorflow.keras.optimizers import Adam
 # Runs in the backgound:
 import optuna.integration # pip install optuna-integration[xgboost]
 
-from variables_tcn import *
+from variables import *
 from plots import plot_optimization, plot_eval_metrics
 
 def print_callback(study, trial):

@@ -276,7 +276,7 @@ def calculate_mean_metrics(time_series_data):
     print("Classification Report for mean predictions:\n", report)
     
 
-def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices, chunk_size=CHUNK_SIZE, X_test=None, model=None, tolerance_window=None, simulated=False):
+def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices, chunk_size=CHUNK_SIZE, X_test=None, model=None, tolerance_window=None, simulated=False, impl_cols=USED_COLS):
     """
     Evaluates the performance of a classification model for detecting earthquake events based on predictions and labels.
     This function calculates and prints various classification metrics such as precision, recall, and F1-score.
@@ -321,7 +321,7 @@ def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices
     tolerance_str = f"{tolerance_str}_sim" if simulated else f"{tolerance_str}"
     
     if not simulated and tolerance_window is None:
-        print(f'Evaluation of performance for model: {MODEL_TYPE} using columns: {USED_COLS} \n')
+        print(f'Evaluation of performance for model: {MODEL_TYPE} using columns: {impl_cols} \n')
     if simulated and tolerance_window is None:
         print('Using simulated data by atrtificially adding random offsets')
     
@@ -423,8 +423,8 @@ def evaluate(test_predictions, test_labels, cleaned_dfs, stations, start_indices
             print("AUC score calculation skipped, as the model does not support probabilities.")
 
     if model is not None and hasattr(model, 'feature_importances_') and tolerance_window is None:
-        non_chunked_columns = [col for col in USED_COLS if col in ['latitude', 'cos_longitude', 'sin_longitude', 'height']]
-        chunked_columns = [col for col in USED_COLS if col not in ['latitude', 'cos_longitude', 'sin_longitude', 'height']]
+        non_chunked_columns = [col for col in impl_cols if col in ['latitude', 'cos_longitude', 'sin_longitude', 'height']]
+        chunked_columns = [col for col in impl_cols if col not in ['latitude', 'cos_longitude', 'sin_longitude', 'height']]
         feature_importances = model.feature_importances_
 
         chunked_importances = feature_importances[:len(chunked_columns) * chunk_size].reshape(-1, len(chunked_columns))

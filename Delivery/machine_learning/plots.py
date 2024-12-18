@@ -9,7 +9,7 @@ import contextily as ctx
 import geopandas as gpd
 from optuna.visualization.matplotlib import plot_optimization_history, plot_param_importances, plot_contour
 
-from variables_tcn import *
+from variables import *
 
 # Define standard font sizes and other plotting parameters for consistency
 legend_fontsize = 16
@@ -243,7 +243,7 @@ def plot_statistics(report, name):
     f1_score = []
     class_labels = []
 
-    for class_idx in range(21):
+    for class_idx in range(CHUNK_SIZE):
         class_key = str(class_idx)
         if class_key in report:
             metrics = report[class_key]
@@ -254,19 +254,22 @@ def plot_statistics(report, name):
                 class_labels.append(class_key)
 
     plt.figure(figsize=plot_size)
-    bar_width = 0.25
-    positions = np.arange(len(precision))
 
-    plt.bar(positions - bar_width, precision, width=bar_width, color='#1f77b4', edgecolor='grey', label='Precision')
-    plt.bar(positions, recall, width=bar_width, color='#2ca02c', edgecolor='grey', label='Recall')
-    plt.bar(positions + bar_width, f1_score, width=bar_width, color='#d62728', edgecolor='grey', label='F1-Score')
+    # Define line styles for each metric
+    plt.plot(class_labels, precision, marker='o', linestyle='-', color='#1f77b4', label='Precision', linewidth=2)
+    plt.plot(class_labels, recall, marker='s', linestyle='--', color='#2ca02c', label='Recall', linewidth=2)
+    plt.plot(class_labels, f1_score, marker='d', linestyle='-.', color='#d62728', label='F1-Score', linewidth=2)
 
+
+    # Add labels, title, and legend
     plt.xlabel('Classes', fontsize=label_fontsize, labelpad=15)
     plt.ylabel('Scores', fontsize=label_fontsize, labelpad=15)
-    plt.xticks(positions, class_labels, rotation=45, ha='center', fontsize=tick_fontsize)
+    every_5th = list(range(0, len(class_labels), 5))
+    plt.xticks(every_5th, [class_labels[i] for i in every_5th], rotation=45, ha='right', fontsize=tick_fontsize)
     plt.yticks(fontsize=tick_fontsize)
     plt.title('Precision, Recall, and F1 Scores per Class', fontsize=title_fontsize, pad=20)
-    
+
+    # Add grid, legend, and save
     plt.grid(True, axis='y', linestyle='--', alpha=0.7)
     plt.legend(loc='best', fontsize=legend_fontsize)
     plt.tight_layout()
@@ -492,6 +495,7 @@ def plot_mean_preds_statistics(values, name, chunk_size=CHUNK_SIZE):
     
     plt.figure(figsize=plot_size)
     bars = plt.bar(labels, values, color=colors, edgecolor='black', linewidth=1.5)
+    plt.axvline(x=2.5, color='gray', linestyle='--', linewidth=1)
     
     plt.ylabel('Percentage', fontsize=label_fontsize, labelpad=15)
     plt.title("Prediction Accuracy Breakdown", fontsize=title_fontsize, pad=20)
@@ -570,8 +574,70 @@ def plot_station_geometries(geometries):
     plt.legend(fontsize=legend_fontsize, loc='best', frameon=True, title="Station Types", title_fontsize=18)
     ax.grid(True, linestyle='--', linewidth=0.7, alpha=0.7)
     plt.savefig(f'{PLOTS_PATH}_stations.png', dpi=dpi_setting, bbox_inches='tight')
-    plt.close(fig)
+    plt.close()
     
+def plot_stacked_horizontal_bars(values, name):
+    """
+    Generates a horizontal stacked bar chart with two bars representing True Offset and Non-Offset classes.
 
+    Parameters:
+    values (list): A list containing five percentages in the following order:
+                   [True Positive, Predicted within chunk_size, False Negative, True Negative, False Positive]
+    name (str): Name used for saving the plot.
 
+    Returns:
+    None
+    """
+    # Unpack input values
+    tp_exact, tp_window, fn, tn, fp = values
+
+    # Data for the two bars
+    true_offset_class = [tp_exact, tp_window, fn]  # True Offset class
+    non_offset_class = [tn, fp]                   # Non-Offset class
+
+    # Define colors
+    colors_true_offset = ['#1f7a1f', '#77dd77', '#e74c3c']  # Dark green, Light green, Red
+    colors_non_offset = ['#1f77b4', '#ff7f0e']             # Blue, Orange
+
+    # Labels for segments
+    labels_true_offset = ['Exact Match', 'Predicted Within Tolerance', 'Undetected']
+    labels_non_offset = ['True Negative', 'False Positive']
+
+    # Plot settings
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bar_height = 0.5  # Height of each bar
+
+    # Plot the True Offset class bar
+    left_offset = 0
+    for i, value in enumerate(true_offset_class):
+        ax.barh('True Offset Class', value, left=left_offset, color=colors_true_offset[i], edgecolor='black', height=bar_height, label=labels_true_offset[i] if left_offset == 0 else "")
+        left_offset += value
+
+    # Plot the Non-Offset class bar
+    left_offset = 0
+    for i, value in enumerate(non_offset_class):
+        ax.barh('Non-Offset Class', value, left=left_offset, color=colors_non_offset[i], edgecolor='black', height=bar_height, label=labels_non_offset[i] if left_offset == 0 else "")
+        left_offset += value
+
+    # Add text annotations for percentages
+    def add_annotations(values_list, y_position, colors):
+        left = 0
+        for i, value in enumerate(values_list):
+            if value > 0:  # Only annotate if the segment has a value
+                ax.text(left + value / 2, y_position, f"{value:.1f}%", ha='center', va='center', fontsize=10, color='white' if i < 2 else 'black', weight='bold')
+            left += value
+
+    add_annotations(true_offset_class, 'True Offset Class', colors_true_offset)
+    add_annotations(non_offset_class, 'Non-Offset Class', colors_non_offset)
+
+    # Title, labels, and legend
+    ax.set_xlim(0, 100)
+    ax.set_xlabel('Percentage', fontsize=12)
+    ax.set_title('Prediction Accuracy for Offset and Non-Offset Classes', fontsize=14, pad=10)
+    ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.15), ncol=3, fontsize=10, frameon=False)
+
+    # Save and close
+    plt.tight_layout()
+    plt.savefig(f'{PLOTS_PATH}_{name}.png', dpi=dpi_setting, bbox_inches='tight')
+    plt.close()
 
