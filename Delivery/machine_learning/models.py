@@ -11,10 +11,12 @@ from xgboost import XGBClassifier, callback
 from sklearn.metrics import f1_score
 import optuna
 import tensorflow as tf
-from keras.models import Model
+from keras.models import Model, load_model
 from keras.layers import Dense, Input, GlobalAveragePooling1D, Conv1D, BatchNormalization, ReLU
 from tensorflow.keras import backend as K
 from tensorflow.keras.callbacks import ReduceLROnPlateau, Callback, EarlyStopping
+from datetime import datetime
+from tensorflow.keras.optimizers import Adam
 
 
 
@@ -339,6 +341,25 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval, weights):
     """
     Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
 
+    The function first checks if a pre-trained model should be loaded based on the 
+    LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
+    specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
+    optimal parameters for training. Otherwise, it will perform Optuna optimization to 
+    identify the best hyperparameters.
+
+    Parameters:
+    X_train (DataFrame): The training set feature matrix.
+    y_train (Series): The training set target vector.
+    X_eval (DataFrame): The evaluation set feature matrix.
+    y_eval (Series): The evaluation set target vector.
+
+    Returns:
+    XGBClassifier: The best XGBoost model after optimization.
+    """
+    
+    """
+    Optimizes an XGBoost classifier using Optuna for hyperparameter tuning.
+
     This function first checks if a pre-trained model should be loaded based on the 
     LOAD_MODEL flag. If this flag is set to True, it will load a model from the 
     specified MODEL_PATH. If the OPTIMAL_PARAMS flag is True, it will use pre-defined 
@@ -411,7 +432,7 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval, weights):
                 verbose=False)
 
         y_pred = xgb.predict(X_eval)
-        f1_macro = f1_score(y_eval, y_pred, average='macro')
+        f1_macro = f1_score(y_eval, y_pred, average='macro' )
         return f1_macro
     
     if LOAD_STUDY:
@@ -449,6 +470,7 @@ def optimize_xgboost(X_train, y_train, X_eval, y_eval, weights):
     plot_eval_metrics(eval_results, 'eval_scores')
     return best_model
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
 def distance_penalized_mse(y_true, y_pred):
     # Get the true and predicted offset positions by finding the index of the max value in each sequence
     true_position = tf.argmax(y_true, axis=-1)
@@ -463,6 +485,7 @@ def distance_penalized_mse(y_true, y_pred):
     
     return tf.reduce_mean(penalized_mse)
 
+@tf.keras.utils.register_keras_serializable(package="Custom")
 def focal_loss(alpha=0.25, gamma=2.0):
     def loss(y_true, y_pred):
         cross_entropy = K.binary_crossentropy(y_true, y_pred)
@@ -472,12 +495,12 @@ def focal_loss(alpha=0.25, gamma=2.0):
         return alpha_weight_factor * modulating_factor * cross_entropy
     return loss
 
-def build_localization_model_tcn(input_shape, time_steps=21, filters=32, kernel_size=3, dilation_rate=1):
+def build_localization_model_tcn(input_shape, depth=3, filters=32, kernel_size=3, dilation_rate=1):
     input_layer = Input(shape=input_shape)
     x = input_layer
 
     # Temporal Convolutional Layers
-    for i in range(3):  # Three layers, can adjust
+    for i in range(depth):  # Three layers, can adjust
         x = Conv1D(filters=filters, kernel_size=kernel_size, dilation_rate=dilation_rate, padding="causal")(x)
         x = BatchNormalization()(x)
         x = ReLU()(x)
@@ -487,17 +510,18 @@ def build_localization_model_tcn(input_shape, time_steps=21, filters=32, kernel_
     x = GlobalAveragePooling1D()(x)
 
     # Output layer for localization
-    localization_output = Dense(time_steps, activation='softmax')(x)
+    localization_output = Dense(CHUNK_SIZE, activation='softmax')(x)
 
     model = Model(inputs=input_layer, outputs=localization_output)
-    model.compile(optimizer='adam', loss=distance_penalized_mse, metrics=['accuracy'])
+    optimizer = Adam(learning_rate=1e-4)
+    model.compile(optimizer=optimizer, loss=distance_penalized_mse, metrics=['accuracy'])
     return model
 
-def build__binary_model_tcn(input_shape, filters=64, kernel_size=5, dilation_rate=1):
+def build_binary_model_tcn(input_shape, depth=5, filters=64, kernel_size=5, dilation_rate=1):
     input_layer = Input(shape=input_shape)
     x = input_layer
 
-    for i in range(5):  # Increase the number of layers
+    for i in range(depth):  # Increase the number of layers
         x = Conv1D(filters=filters, kernel_size=kernel_size, dilation_rate=dilation_rate, padding="causal")(x)
         x = BatchNormalization()(x)
         x = ReLU()(x)
@@ -507,7 +531,234 @@ def build__binary_model_tcn(input_shape, filters=64, kernel_size=5, dilation_rat
     binary_output = Dense(1, activation='sigmoid')(x)
 
     model = Model(inputs=input_layer, outputs=binary_output)
+    optimizer = Adam(learning_rate=1e-4)
     # Use the focal_loss function by calling it to create the actual loss function
-    model.compile(optimizer='adam', loss=focal_loss(alpha=0.25, gamma=2.0), metrics=['accuracy'])
+    model.compile(optimizer=optimizer, loss=focal_loss(alpha=0.25, gamma=2.0), metrics=['accuracy'])
 
     return model
+
+
+def optimize_tcn_binary(X_train, y_bin_train, X_eval, y_bin_eval):
+    """
+    Optimize or load a TCN model for binary classification with the option to use predefined parameters.
+
+    Args:
+        X_train (np.ndarray): Training input data.
+        y_bin_train (np.ndarray): Binary training labels.
+        X_eval (np.ndarray): Evaluation input data for parameter selection.
+        y_bin_eval (np.ndarray): Binary evaluation labels for parameter selection.
+
+    Returns:
+        Model: Trained TCN Binary model.
+    """
+
+
+    if LOAD_BIN_MODEL:
+        print(f"Loading Binary TCN model from: {MODEL_BIN_PATH}")
+        model = load_model(MODEL_BIN_PATH)
+        return model
+
+    if OPTIMAL_BIN_PARAMS:
+        print(f"Training Binary TCN model using the specified optimal parameters: {BEST_PARAMS_TCN_BINARY}")
+        reduce_lr_binary = ReduceLROnPlateau(monitor="val_loss",factor=0.5, patience=5, min_lr=1e-6)
+        early_stopping_binary = EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True)
+        params = BEST_PARAMS_TCN_BINARY
+        model = build_binary_model_tcn(
+            input_shape=(CHUNK_SIZE,X_train.shape[2]),
+            depth=params["depth"],
+            filters=params["filters"],
+            kernel_size=params["kernel_size"],
+            dilation_rate=params["dilation_rate"],
+        )
+        model.fit(X_train, y_bin_train, epochs=EPOCHS, batch_size=params["batch_size"], validation_split=0.2, callbacks=[early_stopping_binary, reduce_lr_binary], verbose=2)
+        if MODEL_BIN_PATH:
+            model.save(MODEL_BIN_PATH)
+            print(f"Binary classification model saved to {MODEL_BIN_PATH}")
+        return model
+
+    # If not optimal params, perform a grid search for hyperparameter optimization
+    print("Performing parameter search for Binary TCN...")
+    param_grid = {
+        "depth": [3,5],
+        "filters": [32,64,128],
+        "kernel_size": [3,5],
+        #Fine tune dilution: Dilution 2 only good if Dilution 1 already performs well
+        "dilation_rate": [1], 
+        "batch_size": [32,64], 
+    }
+    best_model = None
+    best_params = {}
+    best_macro_f1 = -1
+    current_time = datetime.now()
+    print("Starting search at:", current_time)
+
+    # Simple manual grid search (TensorFlow models are not compatible with sklearn's GridSearchCV)
+    for depth in param_grid["depth"]:
+        for filters in param_grid["filters"]:
+            for kernel_size in param_grid["kernel_size"]:
+                for dilation_rate in param_grid["dilation_rate"]:
+                    for batch_size in param_grid["batch_size"]:
+                        print(f"Training TCN with depth={depth}, filters={filters}, kernel_size={kernel_size}, dilation_rate={dilation_rate}, batch size={batch_size}")
+                        model = build_binary_model_tcn(
+                            input_shape=(CHUNK_SIZE,X_train.shape[2]),
+                            depth=depth,
+                            filters=filters,
+                            kernel_size=kernel_size,
+                            dilation_rate=dilation_rate,
+                        )
+                        reduce_lr_binary = ReduceLROnPlateau(monitor="val_loss",factor=0.5, patience=5, min_lr=1e-6)
+                        early_stopping = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+                        model.fit(
+                            X_train, y_bin_train,
+                            validation_split=0.2,
+                            epochs=20, batch_size=batch_size,
+                            callbacks=[early_stopping, reduce_lr_binary],
+                            verbose=0
+                        )
+
+                        # Evaluate macro F1-score on the evaluation set
+                        y_eval_pred = (model.predict(X_eval, verbose=0) > 0.5).astype(int)
+                        eval_macro_f1 = f1_score(y_bin_eval, y_eval_pred, average="macro")
+                        current_time = datetime.now()
+                        print(f"Macro F1 on Eval Set: {eval_macro_f1:.4f}")
+                        print("Found at:", current_time)
+                        print(" ")
+
+                        # Track the best model and parameters
+                        if eval_macro_f1 > best_macro_f1:
+                            best_macro_f1 = eval_macro_f1
+                            best_model = model
+                            best_params = {
+                                "depth": depth,
+                                "filters": filters,
+                                "kernel_size": kernel_size,
+                                "dilation_rate": dilation_rate,
+                                "batch_size" : batch_size
+                            }
+
+    print(f"Best Binary TCN parameters found: {best_params}, Macro F1: {best_macro_f1:.4f}")
+
+    # Save the best model if needed
+    if MODEL_BIN_PATH and best_model:
+        best_model.save(MODEL_BIN_PATH)
+        print(f"Best model saved to {MODEL_BIN_PATH}")
+
+    return best_model
+
+
+def optimize_tcn_loc(X_train, y_loc_train, X_eval, y_loc_eval, y_bin_eval):
+    """
+    Optimize or load a TCN model for binary classification with the option to use predefined parameters.
+
+    Args:
+        X_train (np.ndarray): Training input data.
+        y_loc_train (np.ndarray): Localization training labels.
+        X_eval (np.ndarray): Evaluation input data for parameter selection.
+        y_loc_eval (np.ndarray): Localization evaluation labels for parameter selection.
+
+    Returns:
+        Model: Trained TCN Localization model.
+    """
+
+
+    if LOAD_LOC_MODEL:
+        print(f"Loading TCN Localization model from: {MODEL_LOC_PATH}")
+        model = load_model(MODEL_LOC_PATH, custom_objects={"distance_penalized_mse": distance_penalized_mse,"build_localization_model_tcn": build_localization_model_tcn})
+        return model
+
+    if OPTIMAL_LOC_PARAMS:
+        print(f"Training TCN Localization model using the specified optimal parameters: {BEST_PARAMS_TCN_LOCALIZATION}")
+        reduce_lr_loc = ReduceLROnPlateau(monitor="val_loss",factor=0.5, patience=5, min_lr=1e-6)
+        early_stopping_loc = EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True)
+        params = BEST_PARAMS_TCN_LOCALIZATION
+        model = build_localization_model_tcn(
+            input_shape=(CHUNK_SIZE,X_train.shape[2]),
+            depth=params["depth"],
+            filters=params["filters"],
+            kernel_size=params["kernel_size"],
+            dilation_rate=params["dilation_rate"],
+        )
+        model.fit(X_train, y_loc_train, epochs=EPOCHS, batch_size=params["batch_size"], validation_split=0.2, callbacks=[early_stopping_loc, reduce_lr_loc], verbose=2)
+        if MODEL_LOC_PATH:
+            model.save(MODEL_LOC_PATH)
+            print(f"Localization classification model saved to {MODEL_LOC_PATH}")
+        return model
+
+    # If not optimal params, perform a grid search for hyperparameter optimization
+    print("Performing parameter search for Localization TCN...")
+    param_grid = {
+        "depth": [5,6,7],
+        "filters": [128],
+        "kernel_size": [5,7],
+        "dilation_rate": [1], 
+        "batch_size": [64], 
+    }
+    best_model = None
+    best_params = {}
+    best_macro_f1 = -1
+    
+
+    # Simple manual grid search (TensorFlow models are not compatible with sklearn's GridSearchCV)
+    for filters in param_grid["filters"]:
+        for kernel_size in param_grid["kernel_size"]:
+            for dilation_rate in param_grid["dilation_rate"]:
+                for depth in param_grid["depth"]:
+                    for batch_size in param_grid["batch_size"]:
+                        print(f"Training TCN with filters={filters}, kernel_size={kernel_size}, dilation_rate={dilation_rate}")
+                        model = build_localization_model_tcn(
+                            input_shape=(CHUNK_SIZE,X_train.shape[2]),
+                            depth=depth,
+                            filters=filters,
+                            kernel_size=kernel_size,
+                            dilation_rate=dilation_rate,
+                        )
+                        reduce_lr_binary = ReduceLROnPlateau(monitor="val_loss",factor=0.5, patience=5, min_lr=1e-6)
+                        early_stopping = EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
+                        model.fit(
+                            X_train, y_loc_train,
+                            validation_split=0.2,
+                            epochs=20, batch_size=batch_size,
+                            callbacks=[early_stopping, reduce_lr_binary],
+                            verbose=0
+                        )
+
+                        # Filter samples with offsets for localization training
+                        offset_indices = np.where(y_bin_eval == 1)[0]
+                        X_eval_localization = X_eval[offset_indices]
+                        y_eval_localization = y_loc_eval[offset_indices]
+                        y_eval_localization = np.argmax(y_eval_localization, axis=1)
+
+                        # Evaluate macro F1-score on the evaluation set
+                        eval_pred = model.predict(X_eval_localization, verbose=0)
+                        eval_pred = np.argmax(eval_pred, axis=1)
+
+
+                        #### np.argmax von eval pred??
+
+                        eval_macro_f1 = f1_score(y_eval_localization, eval_pred, average="macro")
+
+                        current_time = datetime.now()
+                        print(f"Macro F1 on Eval Set: {eval_macro_f1:.4f}")
+                        print("Found at:", current_time)
+
+                        # Track the best model and parameters
+                        if eval_macro_f1 > best_macro_f1:
+                            best_macro_f1 = eval_macro_f1
+                            best_model = model
+                            best_params = {
+                                "depth": depth,
+                                "filters": filters,
+                                "kernel_size": kernel_size,
+                                "dilation_rate": dilation_rate,
+                                "batch_size" : batch_size
+                            }
+                    
+
+    print(f"Best TCN Localization parameters found: {best_params}, Macro F1: {best_macro_f1:.4f}")
+
+    # Save the best model if needed
+    if MODEL_LOC_PATH and best_model:
+        best_model.save(MODEL_LOC_PATH)
+        print(f"Best model saved to {MODEL_LOC_PATH}")
+
+    return best_model

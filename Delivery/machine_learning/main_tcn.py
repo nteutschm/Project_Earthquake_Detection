@@ -14,16 +14,20 @@ from sklearn.utils import resample
 from tensorflow.keras import backend as K
 from tensorflow.keras.callbacks import ReduceLROnPlateau, Callback, EarlyStopping
 
-
 pd.options.mode.chained_assignment = None
 
 # Modified the path to ensure all files are correctly located
 sys.path.append('/Users/merlinalfredsson/Notebooks/GNSS_Displacement/Github/Project_Earthquake_Detection/')
+
+if 'variables' in sys.modules:
+    del sys.modules['variables']  # Remove the existing cache for variables
+
 from variables_tcn import *
 from preprocess import *
 from models import *
 from evaluation import *
 from plots import *
+from two_step_testing import *
 
 def prepare_data(X, y, start_index, stations, geometries):
     """
@@ -62,69 +66,134 @@ def prepare_data(X, y, start_index, stations, geometries):
     generating synthetic samples using the SMOTE technique.
     5. Class weights are computed to handle the remaining imbalance in the training set.
     """
-    X = X.iloc[:, :63]
-    scaler = MinMaxScaler()
-    X = scaler.fit_transform(X)
-    num_features = int(X.shape[1]/CHUNK_SIZE) 
-    X = X.reshape(-1, CHUNK_SIZE, num_features, order='F')
-    y_bin = []
-    y_loc = []
-  
-    for value in y:
-        # y_bin: 1 if value is not 0, else 0
-        y_bin.append(1 if value != 0 else 0)
+
+
+    if TRAIN_NA:
+        # Extract latitude and longitude information
+        latitude = X[540]  # Replace with the correct index for latitude
+        print(latitude)
+        cos_longitude = X[541]  # Replace with the correct index for cos_longitude
+        sin_longitude = X[542]  # Replace with the correct index for sin_longitude
+        longitude = np.degrees(np.arctan2(sin_longitude, cos_longitude))
+
+        # Define geographic masks
+        north_america_mask = (latitude > 0) & (longitude >= -180) & (longitude <= -100)
+        new_zealand_mask = (latitude >= -50) & (latitude <= -30) & (longitude >= 165) & (longitude <= 180)
+
+        X = X.iloc[:, :CHUNK_SIZE*3]
+        scaler = MinMaxScaler()
+        X = scaler.fit_transform(X)
+        num_features = int(X.shape[1]/CHUNK_SIZE) 
+        X = X.reshape(-1, CHUNK_SIZE, num_features, order='F')
+        y_bin = []
+        y_loc = []
+    
+        for value in y:
+            # y_bin: 1 if value is not 0, else 0
+            y_bin.append(1 if value != 0 else 0)
+            # y_loc: Array of 21 zeros, with a 1 at the position specified by y[i] (if not 0)
+            loc_array = np.zeros(CHUNK_SIZE)
+            if value != 0:
+                loc_array[value] = 1
+            y_loc.append(loc_array)
+        y_loc = np.array(y_loc)
+        y_bin = np.array(y_bin)
+
+        # Apply masks to stations
+        train_mask = north_america_mask
+        test_mask = new_zealand_mask
+        eval_mask = ~train_mask & ~test_mask  # Use remaining stations as evaluation set
+
+        # Filter data based on masks
+        X_train, y_bin_train, y_loc_train, geometries_train = (
+            X[train_mask],
+            [y_bin[i] for i in range(len(y_bin)) if train_mask[i]],
+            [y_loc[i] for i in range(len(y_loc)) if train_mask[i]],
+            [geometries[i] for i in range(len(geometries)) if train_mask[i]]
+        )
+        X_eval, y_bin_eval, y_loc_eval, geometries_eval = (
+            X[eval_mask],
+            [y_bin[i] for i in range(len(y_bin)) if eval_mask[i]],
+            [y_loc[i] for i in range(len(y_loc)) if eval_mask[i]],
+            [geometries[i] for i in range(len(geometries)) if eval_mask[i]]
+        )
+        X_test, y_bin_test, y_loc_test, test_start_index, geometries_test = (
+            X[test_mask],
+            [y_bin[i] for i in range(len(y_bin)) if test_mask[i]],
+            [y_loc[i] for i in range(len(y_loc)) if test_mask[i]],
+            [start_index[i] for i in range(len(start_index)) if test_mask[i]],
+            [geometries[i] for i in range(len(geometries)) if test_mask[i]]
+        )
+
+        # Extract station IDs for reference
+        train_stations = [stations[i] for i in range(len(stations)) if train_mask[i]]
+        eval_stations = [stations[i] for i in range(len(stations)) if eval_mask[i]]
+        test_stations = [stations[i] for i in range(len(stations)) if test_mask[i]]
+
+    else:
+        X = X.iloc[:, :CHUNK_SIZE*3]
+        scaler = MinMaxScaler()
+        X = scaler.fit_transform(X)
+        num_features = int(X.shape[1]/CHUNK_SIZE) 
+        X = X.reshape(-1, CHUNK_SIZE, num_features, order='F')
+        y_bin = []
+        y_loc = []
+    
+        for value in y:
+            # y_bin: 1 if value is not 0, else 0
+            y_bin.append(1 if value != 0 else 0)
+            
+            # y_loc: Array of 21 zeros, with a 1 at the position specified by y[i] (if not 0)
+            loc_array = np.zeros(CHUNK_SIZE)
+            if value != 0:
+                loc_array[value] = 1
+            y_loc.append(loc_array)
+        y_loc = np.array(y_loc)
+        y_bin = np.array(y_bin)
+
+        rng = np.random.default_rng(seed=RANDOM_STATE)
         
-        # y_loc: Array of 21 zeros, with a 1 at the position specified by y[i] (if not 0)
-        loc_array = np.zeros(CHUNK_SIZE)
-        if value != 0:
-            loc_array[value] = 1
-        y_loc.append(loc_array)
-    
-    y_loc = np.array(y_loc)
-    y_bin = np.array(y_bin)
+        unique_stations = sorted(list(set(stations))) 
+        unique_stations = rng.permutation(unique_stations) 
+        n_train = int(0.7 * len(unique_stations))
+        n_eval = int(0.15 * len(unique_stations))
+        
+        train_stations = unique_stations[:n_train]
+        eval_stations = unique_stations[n_train:n_train + n_eval]
+        test_stations_unique = unique_stations[n_train + n_eval:]
 
-    rng = np.random.default_rng(seed=RANDOM_STATE)
-    
-    unique_stations = sorted(list(set(stations))) 
-    unique_stations = rng.permutation(unique_stations) 
-    n_train = int(0.7 * len(unique_stations))
-    n_eval = int(0.15 * len(unique_stations))
-    
-    train_stations = unique_stations[:n_train]
-    eval_stations = unique_stations[n_train:n_train + n_eval]
-    test_stations_unique = unique_stations[n_train + n_eval:]
+        train_mask = [s in train_stations for s in stations]
+        eval_mask = [s in eval_stations for s in stations]
+        test_mask = [s in test_stations_unique for s in stations]
 
-    train_mask = [s in train_stations for s in stations]
-    eval_mask = [s in eval_stations for s in stations]
-    test_mask = [s in test_stations_unique for s in stations]
-
-    # Filter data based on masks
-    X_train, y_bin_train, y_loc_train, geometries_train = (
-        X[train_mask],
-        [y_bin[i] for i in range(len(y_bin)) if train_mask[i]],
-        [y_loc[i] for i in range(len(y_loc)) if train_mask[i]],
-        [geometries[i] for i in range(len(geometries)) if train_mask[i]]
-    )
-    X_eval, y_bin_eval, y_loc_eval, geometries_eval = (
-        X[eval_mask],
-        [y_bin[i] for i in range(len(y_bin)) if eval_mask[i]],
-        [y_loc[i] for i in range(len(y_loc)) if eval_mask[i]],
-        [geometries[i] for i in range(len(geometries)) if eval_mask[i]]
-    )
-    X_test, y_bin_test, y_loc_test, test_start_index, geometries_test = (
-        X[test_mask],
-        [y_bin[i] for i in range(len(y_bin)) if test_mask[i]],
-        [y_loc[i] for i in range(len(y_loc)) if test_mask[i]],
-        [start_index[i] for i in range(len(start_index)) if test_mask[i]],
-        [geometries[i] for i in range(len(geometries)) if test_mask[i]]
-    )
-    
-    train_stations = [stations[i] for i in range(len(stations)) if train_mask[i]]
-    eval_stations = [stations[i] for i in range(len(stations)) if eval_mask[i]]
-    test_stations = [stations[i] for i in range(len(stations)) if test_mask[i]]
-    
-    if OPTIMAL_PARAMS:
+        # Filter data based on masks
+        X_train, y_bin_train, y_loc_train, geometries_train = (
+            X[train_mask],
+            [y_bin[i] for i in range(len(y_bin)) if train_mask[i]],
+            [y_loc[i] for i in range(len(y_loc)) if train_mask[i]],
+            [geometries[i] for i in range(len(geometries)) if train_mask[i]]
+        )
+        X_eval, y_bin_eval, y_loc_eval, geometries_eval = (
+            X[eval_mask],
+            [y_bin[i] for i in range(len(y_bin)) if eval_mask[i]],
+            [y_loc[i] for i in range(len(y_loc)) if eval_mask[i]],
+            [geometries[i] for i in range(len(geometries)) if eval_mask[i]]
+        )
+        X_test, y_bin_test, y_loc_test, test_start_index, geometries_test = (
+            X[test_mask],
+            [y_bin[i] for i in range(len(y_bin)) if test_mask[i]],
+            [y_loc[i] for i in range(len(y_loc)) if test_mask[i]],
+            [start_index[i] for i in range(len(start_index)) if test_mask[i]],
+            [geometries[i] for i in range(len(geometries)) if test_mask[i]]
+        )
+        
+        train_stations = [stations[i] for i in range(len(stations)) if train_mask[i]]
+        eval_stations = [stations[i] for i in range(len(stations)) if eval_mask[i]]
+        test_stations = [stations[i] for i in range(len(stations)) if test_mask[i]]
+        
+    if OPTIMAL_BIN_PARAMS and OPTIMAL_LOC_PARAMS:
         # Combine train and eval for ndarrays
+        print("combining training and evaluation data")
         X_train = np.concatenate((X_train, X_eval), axis=0)
         y_bin_train = np.concatenate((y_bin_train, y_bin_eval), axis=0)
         y_loc_train = np.concatenate((y_loc_train, y_loc_eval), axis=0)
@@ -142,14 +211,17 @@ def prepare_data(X, y, start_index, stations, geometries):
 
         class_0 = [(x, binary, loc) for x, binary, loc in X_y_combined if binary == 0]
         class_1 = [(x, binary, loc) for x, binary, loc in X_y_combined if binary == 1]
+        print("class 0: ", len(class_0))
+        print("class 1: ", len(class_1))
 
         if len(class_0) > len(class_1):
             class_1_resampled = resample(class_1, replace=True, n_samples=len(class_0), random_state=RANDOM_STATE)
             balanced_data = class_0 + class_1_resampled
+            print("class 1 resampled: ", len(class_1_resampled))
         else:
             class_0_resampled = resample(class_0, replace=True, n_samples=len(class_1), random_state=RANDOM_STATE)
             balanced_data = class_1 + class_0_resampled
-
+        
         X_train, y_bin_train, y_loc_train = zip(*balanced_data)
 
     X_train, y_bin_train, y_loc_train = np.array(X_train), np.array(y_bin_train), np.array(y_loc_train)
@@ -158,7 +230,7 @@ def prepare_data(X, y, start_index, stations, geometries):
     
     return X_train, X_eval, X_test, y_bin_train, y_bin_eval, y_bin_test, y_loc_train, y_loc_eval, y_loc_test, test_start_index, test_stations, (geometries_train, geometries_eval, geometries_test)
 
-def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries):
+def train_model(X, y, start_index, stations, cleaned_dfs, geometries):
     """
     Trains a machine learning model on the provided data and evaluates its performance on the test set.
 
@@ -196,69 +268,55 @@ def train_model(X, y, start_index, stations, model_type, cleaned_dfs, geometries
     
     X_train, X_eval, X_test, y_bin_train, y_bin_eval, y_bin_test, y_loc_train, y_loc_eval, y_loc_test,  test_start_index, test_stations, geometries = prepare_data(X, y, start_index, stations, geometries)
 
+    # Build and train localization model
+    print("Training binary classification model...")
+    model_binary = optimize_tcn_binary(X_train, y_bin_train, X_eval, y_bin_eval)
 
+    # Predict Binary
+    y_pred_probs = model_binary.predict(X_test,verbose=0)
+    y_pred_binary = (y_pred_probs > 0.5).astype(int)
 
-    if model_type == 'TCN' and OPTIMAL_PARAMS is True:
-        # Build and train localization model
-        print("Training binary classification model...")
-        reduce_lr_binary = ReduceLROnPlateau(monitor="val_loss",factor=0.5, patience=5, min_lr=1e-6)
-        early_stopping_binary = EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True)
-        model_binary = build__binary_model_tcn(input_shape=(CHUNK_SIZE, X_train.shape[2]))
-        model_binary.fit(X_train, y_bin_train, epochs=EPOCHS, batch_size=64, validation_split=0.2, callbacks=[early_stopping_binary, reduce_lr_binary], verbose=2)
+    # Filter samples with offsets for localization training
+    #offset_indices = np.where(y_bin_train == 1)[0]
+    offset_indices = np.where(np.argmax(y_loc_train, axis=1) != 0)[0]
+    X_loc_train = X_train[offset_indices]
+    y_loc_train_filtered = y_loc_train[offset_indices]
 
-        # Filter samples with offsets for localization training
-        offset_indices = np.where(y_bin_train == 1)[0]
-        X_train_localization = X_train[offset_indices]
-        y_train_localization_filtered = y_loc_train[offset_indices]
-
-        # Build and train localization model
-        print("Training localization model...")
-        reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6)
-        early_stopping = EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True)
-        model_localization = build_localization_model_tcn(input_shape=(CHUNK_SIZE, X_train.shape[2]), time_steps=CHUNK_SIZE)
-        model_localization.fit(X_train_localization, y_train_localization_filtered, epochs=EPOCHS, batch_size=64, validation_split=0.2, callbacks=[early_stopping, reduce_lr], verbose=2)
-
-        # Predict
-        y_pred_probs = model_binary.predict(X_test)
-        y_pred_binary = (y_pred_probs > 0.5).astype(int)
-        y_pred_localization = model_localization.predict(X_test)
-
-        # Binary Evaluation
-        binary_cm = confusion_matrix(y_bin_test, y_pred_binary)
-        print("binary reports:")
-        print(binary_cm)
-        report_binary = classification_report(y_bin_test, y_pred_binary, target_names=['No Offset', 'Offset'])
-        print(report_binary)
-
-        # Create a mask for binary predictions that are 1
-        mask = y_pred_binary == 1
-        mask = mask.flatten()
-        test_predictions = np.zeros_like(y_pred_binary, dtype=int)
-        test_predictions = test_predictions.flatten()
-        test_predictions[mask] = np.argmax(y_pred_localization[mask], axis=1)
-
-        # Create a mask for binary lables that are 1
-        mask = y_bin_test == 1
-        mask = mask.flatten()
-        y_test = np.zeros_like(y_bin_test, dtype=int)
-        y_test = y_test.flatten()
-        y_test[mask] = np.argmax(y_loc_test[mask], axis=1)
-
-    else:
-        raise ValueError('Used Model Type not implemented. Please control spelling!')
+    # Build and train localization model
+    print("Training localization model...")
+    model_localization = optimize_tcn_loc(X_loc_train, y_loc_train_filtered, X_eval, y_loc_eval, y_bin_eval)
     
+    # Predict Localization
+    y_pred_localization = model_localization.predict(X_test,verbose=0)
+
+    # Create a mask for binary predictions that are 1
+    mask = y_pred_binary == 1
+    mask = mask.flatten()
+    test_predictions = np.zeros_like(y_pred_binary, dtype=int)
+    test_predictions = test_predictions.flatten()
+    test_predictions[mask] = np.argmax(y_pred_localization[mask], axis=1)
+
+    # Create a mask for test lables that include offsets
+    mask = y_bin_test == 1
+    mask = mask.flatten()
+    y_test = np.zeros_like(y_bin_test, dtype=int)
+    y_test = y_test.flatten()
+    y_test[mask] = np.argmax(y_loc_test[mask], axis=1)
+
+    # Convert test predictions
     test_predictions = pd.Series(test_predictions, index=test_start_index)
     test_labels = pd.Series(y_test, index=test_start_index)
     test_stations = pd.Series(test_stations, index=test_start_index)
     
     joblib.dump(model_binary, MODEL_BIN_PATH)
-    joblib.dump(model_binary, MODEL_LOC_PATH)
+    joblib.dump(model_localization, MODEL_LOC_PATH)
     
     for data, path in zip([test_predictions, test_labels, test_stations], [PREDICTIONS_PATH, TEST_LABELS_PATH, STATION_NAMES]):
         data.to_csv(path, index=True)
+
+    test_two_step(X_test, y_bin_test, y_loc_test, test_stations)
     
     for window in [None, 1]:
-        print("/n/n/n")
         test_predictions = evaluate(test_predictions, test_labels, model=model_binary, X_test=X_test, tolerance_window=window, cleaned_dfs=cleaned_dfs, stations=test_stations, start_indices=test_start_index)
     
     return model_binary, geometries
@@ -278,7 +336,6 @@ def main():
     Returns:
     None
     """
-    
     log = open(LOG_FILE, 'w', buffering=1)
     sys.stdout = log
     print("Starting")
@@ -317,7 +374,7 @@ def main():
     pd.Series(y).to_csv(f'{FEATURES_PATH}_target.csv', index=False, header=False)
     
     print("training")
-    model, geometries = train_model(X, y, start_index, stations, model_type=MODEL_TYPE, cleaned_dfs=cleaned_dfs, geometries=geometries)
+    _, geometries = train_model(X, y, start_index, stations, cleaned_dfs=cleaned_dfs, geometries=geometries)
     
     plot_station_geometries(geometries)
     
