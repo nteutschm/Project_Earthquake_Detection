@@ -1,6 +1,6 @@
 # Project Earthquake Detection
 
-This repository contains the workflow and analysis for [Project Description]. The project code and data are organized into folders for ease of use and clarity.
+This repository contains the workflow and analysis for Project Earthquake Detection. The project code and data are organized into folders for ease of use and clarity.
 
 ## Folder Structure
 
